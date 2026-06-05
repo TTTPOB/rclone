@@ -1409,7 +1409,13 @@ func (f *Fs) putMetadata(ctx context.Context, metadata []byte, info fs.ObjectInf
 			return err
 		}
 		obj, err := basePut(ctx, body, info)
-		if obj != nil {
+		if err != nil && obj != nil {
+			if f.removeDataChunkAttempt(ctx, obj, info.Remote()) {
+				metaObject = nil
+			} else {
+				metaObject = obj
+			}
+		} else if obj != nil {
 			metaObject = obj
 		}
 		return err
@@ -1417,17 +1423,17 @@ func (f *Fs) putMetadata(ctx context.Context, metadata []byte, info fs.ObjectInf
 	return metaObject, err
 }
 
-func (f *Fs) removeDataChunkAttempt(ctx context.Context, failed fs.Object, remote string) {
+func (f *Fs) removeDataChunkAttempt(ctx context.Context, failed fs.Object, remote string) bool {
 	if failed != nil {
 		if err := failed.Remove(ctx); err == nil {
-			return
+			return true
 		}
 	}
 	chunk, err := f.base.NewObject(ctx, remote)
 	if err != nil {
-		return
+		return false
 	}
-	silentlyRemove(ctx, chunk)
+	return chunk.Remove(ctx) == nil
 }
 
 type putFn func(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error)
@@ -1534,14 +1540,16 @@ func (c *chunkingReader) Read(buf []byte) (bytesRead int, err error) {
 		buf = buf[0:c.chunkLimit]
 	}
 	bytesRead, err = c.baseReader.Read(buf)
+	if bytesRead > 0 {
+		c.accountBytes(int64(bytesRead))
+		if c.chunkNo == 0 && c.expectSingle && c.readCount <= maxMetadataSize {
+			c.smallHead = append(c.smallHead, buf[:bytesRead]...)
+		}
+	}
 	if err != nil && err != io.EOF {
 		c.err = err
 		c.done = true
 		return
-	}
-	c.accountBytes(int64(bytesRead))
-	if c.chunkNo == 0 && c.expectSingle && bytesRead > 0 && c.readCount <= maxMetadataSize {
-		c.smallHead = append(c.smallHead, buf[:bytesRead]...)
 	}
 	if bytesRead == 0 && c.sizeLeft == 0 {
 		err = io.EOF // Force EOF when no data left.

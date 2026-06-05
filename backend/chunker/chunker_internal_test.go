@@ -218,6 +218,7 @@ func TestChunkerRetryMetadataRetriesWithoutDataRetransfer(t *testing.T) {
 	assert.Equal(t, []byte("cd"), base.objects["file.rclone_chunk.002"].content)
 	assert.Equal(t, []byte("ef"), base.objects["file.rclone_chunk.003"].content)
 	assert.Contains(t, string(base.objects["file"].content), `"nchunks":3`)
+	assert.Equal(t, 1, base.removes["file"])
 }
 
 func TestChunkerRetryMetadataNonRetryableRollback(t *testing.T) {
@@ -288,6 +289,31 @@ func TestChunkerRetryChunksPartialReadHashMetadata(t *testing.T) {
 	assert.Equal(t, []byte("cd"), base.objects["file.rclone_chunk.002"].content)
 	assert.Equal(t, []byte("ef"), base.objects["file.rclone_chunk.003"].content)
 	assert.Equal(t, 1, base.removes[base.puts[1]])
+}
+
+func TestChunkingReaderAccountsBytesWithReadError(t *testing.T) {
+	errRead := fserrors.RetryError(errors.New("source read failed"))
+	c := &chunkingReader{
+		baseReader: &readThenError{
+			data: []byte("ab"),
+			err:  errRead,
+		},
+		sizeTotal:  4,
+		sizeLeft:   4,
+		chunkSize:  4,
+		chunkLimit: 4,
+	}
+
+	buf := make([]byte, 4)
+	n, err := c.Read(buf)
+	require.ErrorIs(t, err, errRead)
+	assert.Equal(t, 2, n)
+	assert.Equal(t, []byte("ab"), buf[:n])
+	assert.Equal(t, int64(2), c.readCount)
+	assert.Equal(t, int64(2), c.chunkLimit)
+	assert.Equal(t, int64(2), c.sizeLeft)
+	assert.True(t, c.done)
+	assert.ErrorIs(t, c.err, errRead)
 }
 
 func TestChunkerLinearReaderReopensChunkOnReadError(t *testing.T) {
@@ -1497,6 +1523,20 @@ func (r *countingStringReader) Read(b []byte) (int, error) {
 	n, err := r.r.Read(b)
 	r.n += int64(n)
 	return n, err
+}
+
+type readThenError struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (r *readThenError) Read(b []byte) (int, error) {
+	if r.done {
+		return 0, r.err
+	}
+	r.done = true
+	return copy(b, r.data), r.err
 }
 
 type retryOpenChunk struct {
