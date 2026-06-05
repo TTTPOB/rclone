@@ -188,6 +188,68 @@ func TestChunkerRetryChunksPartialReadReplay(t *testing.T) {
 	assert.Equal(t, 0, base.lookups[src.Remote()])
 }
 
+func TestChunkerRetryMetadataRetriesWithoutDataRetransfer(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 2
+
+	f := newTestRetryChunkFs(t, false)
+	in := bytes.NewBufferString("abcdef")
+	src := object.NewStaticObjectInfo("file", mtime1, 6, true, nil, nil)
+	failErr := fserrors.RetryError(errors.New("retry metadata"))
+
+	obj, err := f.put(ctx, in, src, "file", nil, retryChunkBasePutRemote(f.base.(*retryChunkBaseFs), map[string][]error{
+		"file": {failErr},
+	}), "put", nil)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, int64(6), obj.Size())
+
+	base := f.base.(*retryChunkBaseFs)
+	assert.Equal(t, map[string]int{
+		base.puts[0]: 1,
+		base.puts[1]: 1,
+		base.puts[2]: 1,
+		"file":       2,
+	}, base.remotes)
+	require.Len(t, base.puts, 5)
+	assert.Equal(t, "file", base.puts[3])
+	assert.Equal(t, "file", base.puts[4])
+	assert.Equal(t, []byte("ab"), base.objects["file.rclone_chunk.001"].content)
+	assert.Equal(t, []byte("cd"), base.objects["file.rclone_chunk.002"].content)
+	assert.Equal(t, []byte("ef"), base.objects["file.rclone_chunk.003"].content)
+	assert.Contains(t, string(base.objects["file"].content), `"nchunks":3`)
+}
+
+func TestChunkerRetryMetadataNonRetryableRollback(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 2
+
+	f := newTestRetryChunkFs(t, false)
+	in := bytes.NewBufferString("abcdef")
+	src := object.NewStaticObjectInfo("file", mtime1, 6, true, nil, nil)
+	failErr := errors.New("metadata failed")
+
+	obj, err := f.put(ctx, in, src, "file", nil, retryChunkBasePutRemote(f.base.(*retryChunkBaseFs), map[string][]error{
+		"file": {failErr},
+	}), "put", nil)
+	require.ErrorIs(t, err, failErr)
+	assert.Nil(t, obj)
+
+	base := f.base.(*retryChunkBaseFs)
+	require.Len(t, base.puts, 4)
+	assert.Equal(t, map[string]int{
+		base.puts[0]: 1,
+		base.puts[1]: 1,
+		base.puts[2]: 1,
+		"file":       1,
+	}, base.remotes)
+	assert.Empty(t, base.objects)
+	assert.Equal(t, 1, base.removes["file.rclone_chunk.001"])
+	assert.Equal(t, 1, base.removes["file.rclone_chunk.002"])
+	assert.Equal(t, 1, base.removes["file.rclone_chunk.003"])
+	assert.Equal(t, 1, base.removes["file"])
+}
+
 // test that chunking does not break large uploads
 func testPutLarge(t *testing.T, f *Fs, kilobytes int) {
 	t.Run(fmt.Sprintf("PutLarge%dk", kilobytes), func(t *testing.T) {
@@ -1286,6 +1348,25 @@ func retryChunkBasePut(base *retryChunkBaseFs, failures map[int]error) putFn {
 			return nil, err
 		}
 		if err = failures[base.calls]; err != nil {
+			return obj, err
+		}
+		return obj, nil
+	}
+}
+
+func retryChunkBasePutRemote(base *retryChunkBaseFs, failures map[string][]error) putFn {
+	return func(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+		base.calls++
+		remote := src.Remote()
+		base.puts = append(base.puts, remote)
+		base.remotes[remote]++
+		obj, err := base.Put(ctx, in, src, options...)
+		if err != nil {
+			return nil, err
+		}
+		if errs := failures[remote]; len(errs) > 0 {
+			err = errs[0]
+			failures[remote] = errs[1:]
 			return obj, err
 		}
 		return obj, nil

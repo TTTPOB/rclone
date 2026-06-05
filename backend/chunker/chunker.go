@@ -1354,7 +1354,7 @@ func (f *Fs) put(
 	}
 	if err == nil {
 		metaInfo := f.wrapInfo(src, baseRemote, int64(len(metadata)))
-		metaObject, err = basePut(ctx, bytes.NewReader(metadata), metaInfo)
+		metaObject, err = f.putMetadata(ctx, metadata, metaInfo, basePut)
 	}
 	if err != nil {
 		return nil, err
@@ -1398,6 +1398,23 @@ func (f *Fs) putDataChunk(ctx context.Context, in io.Reader, info fs.ObjectInfo,
 		return err
 	})
 	return chunk, err
+}
+
+func (f *Fs) putMetadata(ctx context.Context, metadata []byte, info fs.ObjectInfo, basePut putFn) (fs.Object, error) {
+	ci := fs.GetConfig(ctx)
+	body := bytes.NewReader(metadata)
+	var metaObject fs.Object
+	err := operations.Retry(ctx, info, ci.LowLevelRetries, func() error {
+		if _, err := body.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		obj, err := basePut(ctx, body, info)
+		if obj != nil {
+			metaObject = obj
+		}
+		return err
+	})
+	return metaObject, err
 }
 
 func (f *Fs) removeDataChunkAttempt(ctx context.Context, failed fs.Object, remote string) {
