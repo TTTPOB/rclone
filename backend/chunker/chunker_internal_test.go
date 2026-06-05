@@ -250,6 +250,46 @@ func TestChunkerRetryMetadataNonRetryableRollback(t *testing.T) {
 	assert.Equal(t, 1, base.removes["file"])
 }
 
+func TestChunkerRetryChunksPartialReadHashMetadata(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 2
+
+	f := newTestRetryChunkFs(t, true)
+	require.NoError(t, f.setHashType("md5"))
+	f.opt.HashType = "md5"
+
+	content := "abcdef"
+	expectedMD5 := "e80b5017098950fc58aad83c8c14978e"
+	in := &countingStringReader{r: strings.NewReader(content)}
+	src := object.NewStaticObjectInfo("file", mtime1, int64(len(content)), true, nil, nil)
+	failErr := fserrors.RetryError(errors.New("partial read retry"))
+
+	obj, err := f.put(ctx, in, src, "file", nil, retryChunkPartialBasePut(f.base.(*retryChunkBaseFs), 2, 1, failErr), "put", nil)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, int64(len(content)), in.n)
+
+	rc, err := obj.Open(ctx)
+	require.NoError(t, err)
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+	assert.Equal(t, content, string(got))
+
+	sum, err := obj.Hash(ctx, hash.MD5)
+	require.NoError(t, err)
+	assert.Equal(t, expectedMD5, sum)
+
+	base := f.base.(*retryChunkBaseFs)
+	meta := string(base.objects["file"].content)
+	assert.Contains(t, meta, `"nchunks":3`)
+	assert.Contains(t, meta, `"md5":"`+expectedMD5+`"`)
+	assert.Equal(t, []byte("ab"), base.objects["file.rclone_chunk.001"].content)
+	assert.Equal(t, []byte("cd"), base.objects["file.rclone_chunk.002"].content)
+	assert.Equal(t, []byte("ef"), base.objects["file.rclone_chunk.003"].content)
+	assert.Equal(t, 1, base.removes[base.puts[1]])
+}
+
 // test that chunking does not break large uploads
 func testPutLarge(t *testing.T, f *Fs, kilobytes int) {
 	t.Run(fmt.Sprintf("PutLarge%dk", kilobytes), func(t *testing.T) {
@@ -1368,6 +1408,35 @@ func retryChunkBasePutRemote(base *retryChunkBaseFs, failures map[string][]error
 			err = errs[0]
 			failures[remote] = errs[1:]
 			return obj, err
+		}
+		return obj, nil
+	}
+}
+
+func retryChunkPartialBasePut(base *retryChunkBaseFs, failCall, readBytes int, failErr error) putFn {
+	return func(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+		base.calls++
+		remote := src.Remote()
+		base.puts = append(base.puts, remote)
+		base.remotes[remote]++
+		if base.calls == failCall {
+			buf := make([]byte, readBytes)
+			n, err := io.ReadFull(in, buf)
+			if err != nil {
+				return nil, err
+			}
+			obj := &retryChunkObject{
+				fs:      base,
+				remote:  remote,
+				modTime: src.ModTime(ctx),
+				content: append([]byte(nil), buf[:n]...),
+			}
+			base.objects[remote] = obj
+			return obj, failErr
+		}
+		obj, err := base.Put(ctx, in, src, options...)
+		if err != nil {
+			return nil, err
 		}
 		return obj, nil
 	}
