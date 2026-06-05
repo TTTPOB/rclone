@@ -3,6 +3,7 @@ package chunker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -10,9 +11,11 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
@@ -53,6 +56,136 @@ func TestChunkerRetrySpoolOptions(t *testing.T) {
 	assert.Contains(t, spoolDir.Help, "--temp-dir")
 	assert.Contains(t, spoolDir.Help, "tmpfs")
 	assert.Contains(t, spoolDir.Help, "RAM")
+}
+
+func TestChunkerRetryChunksRetriesCurrentChunk(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 2
+
+	f := newTestRetryChunkFs(t, true)
+	f.opt.SpoolThreshold = 0
+	f.opt.SpoolDir = t.TempDir()
+	in := bytes.NewBufferString("abcdef")
+	src := object.NewStaticObjectInfo("file", mtime1, 6, true, nil, nil)
+	failErr := fserrors.RetryError(errors.New("retry chunk"))
+
+	obj, err := f.put(ctx, in, src, "file", nil, retryChunkBasePut(f.base.(*retryChunkBaseFs), map[int]error{
+		2: failErr,
+	}), "put", nil)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, int64(6), obj.Size())
+
+	base := f.base.(*retryChunkBaseFs)
+	require.Len(t, base.puts, 5)
+	assert.NotEqual(t, base.puts[0], base.puts[1])
+	assert.Equal(t, base.puts[1], base.puts[2])
+	assert.NotEqual(t, base.puts[2], base.puts[3])
+	assert.Equal(t, map[string]int{
+		base.puts[0]: 1,
+		base.puts[1]: 2,
+		base.puts[3]: 1,
+		"file":       1,
+	}, base.remotes)
+	assert.Equal(t, 1, base.removes[base.puts[1]])
+	assert.Equal(t, []byte("ab"), base.objects["file.rclone_chunk.001"].content)
+	assert.Equal(t, []byte("cd"), base.objects["file.rclone_chunk.002"].content)
+	assert.Equal(t, []byte("ef"), base.objects["file.rclone_chunk.003"].content)
+	assert.Contains(t, string(base.objects["file"].content), `"nchunks":3`)
+}
+
+func TestChunkerRetryChunksNonRetryableError(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 2
+
+	f := newTestRetryChunkFs(t, true)
+	in := bytes.NewBufferString("abcdef")
+	src := object.NewStaticObjectInfo("file", mtime1, 6, true, nil, nil)
+	failErr := errors.New("do not retry")
+
+	obj, err := f.put(ctx, in, src, "file", nil, retryChunkBasePut(f.base.(*retryChunkBaseFs), map[int]error{
+		2: failErr,
+	}), "put", nil)
+	require.ErrorIs(t, err, failErr)
+	assert.Nil(t, obj)
+
+	base := f.base.(*retryChunkBaseFs)
+	require.Len(t, base.puts, 2)
+	assert.NotEqual(t, base.puts[0], base.puts[1])
+	assert.Equal(t, map[string]int{
+		base.puts[0]: 1,
+		base.puts[1]: 1,
+	}, base.remotes)
+	assert.Equal(t, 1, base.removes[base.puts[1]])
+	assert.Equal(t, 1, base.removes[base.puts[0]])
+	assert.Empty(t, base.objects)
+}
+
+func TestChunkerRetryChunksDisabledDoesNotRetry(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 2
+
+	f := newTestRetryChunkFs(t, false)
+	in := bytes.NewBufferString("abcdef")
+	src := object.NewStaticObjectInfo("file", mtime1, 6, true, nil, nil)
+	failErr := fserrors.RetryError(errors.New("retry disabled"))
+
+	obj, err := f.put(ctx, in, src, "file", nil, retryChunkBasePut(f.base.(*retryChunkBaseFs), map[int]error{
+		2: failErr,
+	}), "put", nil)
+	require.ErrorIs(t, err, failErr)
+	assert.Nil(t, obj)
+
+	base := f.base.(*retryChunkBaseFs)
+	require.Len(t, base.puts, 2)
+	assert.Equal(t, map[string]int{
+		base.puts[0]: 1,
+		base.puts[1]: 1,
+	}, base.remotes)
+	assert.Equal(t, 1, base.removes[base.puts[0]])
+	assert.Equal(t, 0, base.removes[base.puts[1]])
+	assert.NotContains(t, base.objects, base.puts[0])
+	assert.Contains(t, base.objects, base.puts[1])
+}
+
+func TestChunkerRetryChunksPartialReadReplay(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 2
+
+	f := newTestRetryChunkFs(t, true)
+	f.opt.SpoolThreshold = 0
+	f.opt.SpoolDir = t.TempDir()
+	base := f.base.(*retryChunkBaseFs)
+	src := object.NewStaticObjectInfo("file.rclone_chunk.001_temp", mtime1, 2, true, nil, nil)
+	in := &countingStringReader{r: strings.NewReader("ab")}
+	failErr := fserrors.RetryError(errors.New("partial read retry"))
+
+	var calls int
+	chunk, err := f.putDataChunk(ctx, in, src, nil, func(ctx context.Context, body io.Reader, info fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+		calls++
+		if calls == 1 {
+			buf := make([]byte, 1)
+			n, readErr := body.Read(buf)
+			require.NoError(t, readErr)
+			require.Equal(t, 1, n)
+			obj := &retryChunkObject{
+				fs:      base,
+				remote:  info.Remote(),
+				modTime: info.ModTime(ctx),
+				content: append([]byte(nil), buf[:n]...),
+			}
+			base.objects[obj.remote] = obj
+			return obj, failErr
+		}
+		return base.Put(ctx, body, info, options...)
+	})
+	require.NoError(t, err)
+	require.NotNil(t, chunk)
+	assert.Equal(t, 2, calls)
+	assert.Equal(t, int64(2), in.n)
+	assert.Equal(t, []byte("ab"), base.objects[src.Remote()].content)
+	assert.Equal(t, 1, base.removes[src.Remote()])
+	assert.Equal(t, 0, base.lookups[src.Remote()])
 }
 
 // test that chunking does not break large uploads
@@ -963,3 +1096,212 @@ func (f *Fs) InternalTest(t *testing.T) {
 }
 
 var _ fstests.InternalTester = (*Fs)(nil)
+
+func newTestRetryChunkFs(t *testing.T, retryChunks bool) *Fs {
+	base := newRetryChunkBaseFs()
+	f := &Fs{
+		name: "chunker",
+		root: "",
+		base: base,
+		opt: Options{
+			ChunkSize:      fs.SizeSuffix(2),
+			NameFormat:     "*.rclone_chunk.###",
+			StartFrom:      1,
+			MetaFormat:     "simplejson",
+			HashType:       "none",
+			RetryChunks:    retryChunks,
+			SpoolThreshold: fs.Gibi,
+		},
+	}
+	require.NoError(t, f.configure(f.opt.NameFormat, f.opt.MetaFormat, f.opt.HashType, "rename"))
+	return f
+}
+
+type retryChunkBaseFs struct {
+	features *fs.Features
+	objects  map[string]*retryChunkObject
+	puts     []string
+	remotes  map[string]int
+	removes  map[string]int
+	lookups  map[string]int
+	calls    int
+}
+
+func newRetryChunkBaseFs() *retryChunkBaseFs {
+	f := &retryChunkBaseFs{
+		features: &fs.Features{},
+		objects:  map[string]*retryChunkObject{},
+		remotes:  map[string]int{},
+		removes:  map[string]int{},
+		lookups:  map[string]int{},
+	}
+	f.features.Move = f.Move
+	return f
+}
+
+func (f *retryChunkBaseFs) Name() string {
+	return "retryChunkBase"
+}
+
+func (f *retryChunkBaseFs) Root() string {
+	return ""
+}
+
+func (f *retryChunkBaseFs) String() string {
+	return "retry chunk base"
+}
+
+func (f *retryChunkBaseFs) Precision() time.Duration {
+	return time.Nanosecond
+}
+
+func (f *retryChunkBaseFs) Hashes() hash.Set {
+	return hash.Set(hash.None)
+}
+
+func (f *retryChunkBaseFs) Features() *fs.Features {
+	return f.features
+}
+
+func (f *retryChunkBaseFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	return nil, fs.ErrorDirNotFound
+}
+
+func (f *retryChunkBaseFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	f.lookups[remote]++
+	obj, ok := f.objects[remote]
+	if !ok {
+		return nil, fs.ErrorObjectNotFound
+	}
+	return obj, nil
+}
+
+func (f *retryChunkBaseFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	obj := &retryChunkObject{
+		fs:      f,
+		remote:  src.Remote(),
+		modTime: src.ModTime(ctx),
+	}
+	content, err := io.ReadAll(in)
+	if err != nil {
+		return nil, err
+	}
+	obj.content = content
+	f.objects[obj.remote] = obj
+	return obj, nil
+}
+
+func (f *retryChunkBaseFs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*retryChunkObject)
+	if !ok {
+		return nil, fs.ErrorCantMove
+	}
+	delete(f.objects, srcObj.remote)
+	obj := &retryChunkObject{
+		fs:      f,
+		remote:  remote,
+		modTime: srcObj.modTime,
+		content: append([]byte(nil), srcObj.content...),
+	}
+	f.objects[remote] = obj
+	return obj, nil
+}
+
+func (f *retryChunkBaseFs) Mkdir(ctx context.Context, dir string) error {
+	return nil
+}
+
+func (f *retryChunkBaseFs) Rmdir(ctx context.Context, dir string) error {
+	return fs.ErrorDirNotFound
+}
+
+type retryChunkObject struct {
+	fs      *retryChunkBaseFs
+	remote  string
+	modTime time.Time
+	content []byte
+}
+
+func (o *retryChunkObject) Fs() fs.Info {
+	return o.fs
+}
+
+func (o *retryChunkObject) Remote() string {
+	return o.remote
+}
+
+func (o *retryChunkObject) String() string {
+	return o.remote
+}
+
+func (o *retryChunkObject) ModTime(ctx context.Context) time.Time {
+	return o.modTime
+}
+
+func (o *retryChunkObject) Size() int64 {
+	return int64(len(o.content))
+}
+
+func (o *retryChunkObject) Storable() bool {
+	return true
+}
+
+func (o *retryChunkObject) Hash(ctx context.Context, h hash.Type) (string, error) {
+	return "", hash.ErrUnsupported
+}
+
+func (o *retryChunkObject) SetModTime(ctx context.Context, modTime time.Time) error {
+	o.modTime = modTime
+	return nil
+}
+
+func (o *retryChunkObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(o.content)), nil
+}
+
+func (o *retryChunkObject) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	content, err := io.ReadAll(in)
+	if err != nil {
+		return err
+	}
+	o.content = content
+	o.modTime = src.ModTime(ctx)
+	return nil
+}
+
+func (o *retryChunkObject) Remove(ctx context.Context) error {
+	delete(o.fs.objects, o.remote)
+	o.fs.removes[o.remote]++
+	return nil
+}
+
+func retryChunkBasePut(base *retryChunkBaseFs, failures map[int]error) putFn {
+	return func(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+		base.calls++
+		remote := src.Remote()
+		base.puts = append(base.puts, remote)
+		base.remotes[remote]++
+		obj, err := base.Put(ctx, in, src, options...)
+		if err != nil {
+			return nil, err
+		}
+		if err = failures[base.calls]; err != nil {
+			return obj, err
+		}
+		return obj, nil
+	}
+}
+
+var _ fs.Fs = (*retryChunkBaseFs)(nil)
+var _ fs.Object = (*retryChunkObject)(nil)
+
+type countingStringReader struct {
+	r *strings.Reader
+	n int64
+}
+
+func (r *countingStringReader) Read(b []byte) (int, error) {
+	n, err := r.r.Read(b)
+	r.n += int64(n)
+	return n, err
+}

@@ -13,6 +13,7 @@ import (
 	gohash "hash"
 	"io"
 	"math/rand"
+	"os"
 	"path"
 	"regexp"
 	"sort"
@@ -30,6 +31,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/readers"
 )
 
 // Chunker's composite files have one or more chunks
@@ -1231,7 +1233,7 @@ func (f *Fs) put(
 		// Refill chunkLimit and let basePut repeatedly call chunkingReader.Read()
 		c.chunkLimit = c.chunkSize
 		// TODO: handle range/limit options
-		chunk, errChunk := basePut(ctx, wrapIn, info, options...)
+		chunk, errChunk := f.putDataChunk(ctx, wrapIn, info, options, basePut)
 		if errChunk != nil {
 			return nil, errChunk
 		}
@@ -1362,6 +1364,53 @@ func (f *Fs) put(
 	o.size = sizeTotal
 	o.xactID = xactID
 	return o, nil
+}
+
+func (f *Fs) putDataChunk(ctx context.Context, in io.Reader, info fs.ObjectInfo, options []fs.OpenOption, basePut putFn) (fs.Object, error) {
+	if !f.opt.RetryChunks {
+		return basePut(ctx, in, info, options...)
+	}
+
+	ci := fs.GetConfig(ctx)
+	spoolDir := f.opt.SpoolDir
+	if spoolDir == "" {
+		spoolDir = os.TempDir()
+	}
+
+	replay := readers.NewSpillableReplayReader(in, int64(f.opt.SpoolThreshold), spoolDir)
+	defer func() {
+		if err := replay.Close(); err != nil {
+			fs.Errorf(info, "Failed to close chunk retry replay cache: %v", err)
+		}
+	}()
+
+	var chunk fs.Object
+	err := operations.Retry(ctx, info, ci.LowLevelRetries, func() error {
+		if _, err := replay.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		var err error
+		chunk, err = basePut(ctx, replay, info, options...)
+		if err != nil {
+			f.removeDataChunkAttempt(ctx, chunk, info.Remote())
+			chunk = nil
+		}
+		return err
+	})
+	return chunk, err
+}
+
+func (f *Fs) removeDataChunkAttempt(ctx context.Context, failed fs.Object, remote string) {
+	if failed != nil {
+		if err := failed.Remove(ctx); err == nil {
+			return
+		}
+	}
+	chunk, err := f.base.NewObject(ctx, remote)
+	if err != nil {
+		return
+	}
+	silentlyRemove(ctx, chunk)
 }
 
 type putFn func(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error)
