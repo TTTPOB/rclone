@@ -135,6 +135,29 @@ when handling transfers primarily composed of small files on some backends
 the chunk threshold via `--min-size` and then perform a separate call without
 chunker on the remaining files.
 
+#### Chunk retry and spool
+
+Chunk-level retry is disabled by default. If `--chunker-retry-chunks` is
+enabled, chunker retries a single data chunk upload using the global
+`--low-level-retries` setting. The metadata upload is retried in the same way.
+There is no separate chunker retry count.
+
+Composite downloads also use low-level reopen when reading wrapped data chunks,
+so a transient read failure can reopen the current chunk/range and continue
+within the same transfer.
+
+This is not cross-session resumable upload or download. It only covers retry
+within the same rclone process and the same transfer.
+
+To retry a chunk upload, chunker must be able to replay the current chunk body.
+It keeps replay data in memory until `--chunker-spool-threshold` is exceeded,
+then moves the replay cache to a temporary file. The default threshold is
+`1Gi`.
+
+`--chunker-spool-dir` controls where temporary replay files are created. If it
+is empty, chunker uses the global `--temp-dir` setting. If `/tmp` or the chosen
+spool directory is backed by tmpfs, spilling still consumes RAM.
+
 #### Chunk names
 
 The default chunk name format is `*.rclone_chunk.###`, hence by default
@@ -468,6 +491,49 @@ Properties:
     - Rename or norename will be used depending on capabilities of the backend.
     - If meta format is set to "none", rename transactions will always be used.
     - This method is EXPERIMENTAL, don't use on production systems.
+
+#### --chunker-retry-chunks
+
+Retry data chunk uploads.
+
+When enabled, chunker retries individual data chunk uploads using the global
+--low-level-retries setting.
+
+Properties:
+
+- Config:      retry_chunks
+- Env Var:     RCLONE_CHUNKER_RETRY_CHUNKS
+- Type:        bool
+- Default:     false
+
+#### --chunker-spool-threshold
+
+Memory threshold for chunk retry replay cache.
+
+When chunk retry is enabled, replay data is cached in memory until this
+threshold is exceeded, then moved to a temporary file.
+
+Properties:
+
+- Config:      spool_threshold
+- Env Var:     RCLONE_CHUNKER_SPOOL_THRESHOLD
+- Type:        SizeSuffix
+- Default:     1Gi
+
+#### --chunker-spool-dir
+
+Directory for chunk retry temporary files.
+
+When empty, chunker uses the global --temp-dir setting.
+If the global /tmp or the specified directory is tmpfs, spilled replay cache
+still consumes RAM.
+
+Properties:
+
+- Config:      spool_dir
+- Env Var:     RCLONE_CHUNKER_SPOOL_DIR
+- Type:        string
+- Required:    false
 
 #### --chunker-description
 
