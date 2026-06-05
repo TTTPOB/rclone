@@ -290,6 +290,49 @@ func TestChunkerRetryChunksPartialReadHashMetadata(t *testing.T) {
 	assert.Equal(t, 1, base.removes[base.puts[1]])
 }
 
+func TestChunkerLinearReaderReopensChunkOnReadError(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 2
+
+	chunk1 := newRetryOpenChunk("file.rclone_chunk.001", "abc").failReadOnce(1, errors.New("read failed"))
+	chunk2 := newRetryOpenChunk("file.rclone_chunk.002", "def")
+	obj := &Object{
+		remote: "file",
+		chunks: []fs.Object{chunk1, chunk2},
+		size:   6,
+	}
+
+	rc, err := obj.newLinearReader(ctx, 0, 6, nil)
+	require.NoError(t, err)
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+	assert.Equal(t, "abcdef", string(got))
+	assert.Equal(t, 2, chunk1.opens)
+	assert.Equal(t, 1, chunk2.opens)
+}
+
+func TestChunkerLinearReaderReopenRetriesExhausted(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 1
+
+	failErr := errors.New("read failed")
+	chunk := newRetryOpenChunk("file.rclone_chunk.001", "abc").failReadAlways(1, failErr)
+	obj := &Object{
+		remote: "file",
+		chunks: []fs.Object{chunk},
+		size:   3,
+	}
+
+	rc, err := obj.newLinearReader(ctx, 0, 3, nil)
+	require.NoError(t, err)
+	got, err := io.ReadAll(rc)
+	require.Error(t, err)
+	_ = rc.Close()
+	assert.Equal(t, "a", string(got))
+	assert.Equal(t, 1, chunk.opens)
+}
+
 // test that chunking does not break large uploads
 func testPutLarge(t *testing.T, f *Fs, kilobytes int) {
 	t.Run(fmt.Sprintf("PutLarge%dk", kilobytes), func(t *testing.T) {
@@ -1455,3 +1498,138 @@ func (r *countingStringReader) Read(b []byte) (int, error) {
 	r.n += int64(n)
 	return n, err
 }
+
+type retryOpenChunk struct {
+	remote     string
+	content    []byte
+	failAfter  int
+	failErr    error
+	failAlways bool
+	failed     bool
+	opens      int
+}
+
+func newRetryOpenChunk(remote, content string) *retryOpenChunk {
+	return &retryOpenChunk{
+		remote:  remote,
+		content: []byte(content),
+	}
+}
+
+func (o *retryOpenChunk) failReadOnce(after int, err error) *retryOpenChunk {
+	o.failAfter = after
+	o.failErr = err
+	return o
+}
+
+func (o *retryOpenChunk) failReadAlways(after int, err error) *retryOpenChunk {
+	o.failAfter = after
+	o.failErr = err
+	o.failAlways = true
+	return o
+}
+
+func (o *retryOpenChunk) Fs() fs.Info {
+	return object.MemoryFs
+}
+
+func (o *retryOpenChunk) Remote() string {
+	return o.remote
+}
+
+func (o *retryOpenChunk) String() string {
+	return o.remote
+}
+
+func (o *retryOpenChunk) ModTime(ctx context.Context) time.Time {
+	return mtime1
+}
+
+func (o *retryOpenChunk) Size() int64 {
+	return int64(len(o.content))
+}
+
+func (o *retryOpenChunk) Storable() bool {
+	return true
+}
+
+func (o *retryOpenChunk) Hash(ctx context.Context, h hash.Type) (string, error) {
+	return "", hash.ErrUnsupported
+}
+
+func (o *retryOpenChunk) SetModTime(ctx context.Context, modTime time.Time) error {
+	return nil
+}
+
+func (o *retryOpenChunk) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	o.opens++
+	var offset, limit int64 = 0, -1
+	for _, option := range options {
+		switch x := option.(type) {
+		case *fs.RangeOption:
+			offset, limit = x.Decode(o.Size())
+		case *fs.SeekOption:
+			offset = x.Offset
+		default:
+			if option.Mandatory() {
+				return nil, fmt.Errorf("unsupported mandatory option: %v", option)
+			}
+		}
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > int64(len(o.content)) {
+		offset = int64(len(o.content))
+	}
+	end := int64(len(o.content))
+	if limit >= 0 && offset+limit < end {
+		end = offset + limit
+	}
+	reader := bytes.NewReader(o.content[offset:end])
+	if o.failErr == nil || o.failed && !o.failAlways {
+		return io.NopCloser(reader), nil
+	}
+	o.failed = true
+	return &failingReadCloser{
+		reader:    reader,
+		failAfter: o.failAfter,
+		err:       o.failErr,
+	}, nil
+}
+
+func (o *retryOpenChunk) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	return errors.New("retryOpenChunk.Update not supported")
+}
+
+func (o *retryOpenChunk) Remove(ctx context.Context) error {
+	return errors.New("retryOpenChunk.Remove not supported")
+}
+
+type failingReadCloser struct {
+	reader    *bytes.Reader
+	failAfter int
+	read      int
+	err       error
+}
+
+func (r *failingReadCloser) Read(p []byte) (int, error) {
+	if r.read >= r.failAfter {
+		return 0, r.err
+	}
+	if remaining := r.failAfter - r.read; remaining < len(p) {
+		p = p[:remaining]
+	}
+	n, err := r.reader.Read(p)
+	r.read += n
+	if err == io.EOF && r.read >= r.failAfter {
+		err = r.err
+	}
+	return n, err
+}
+
+func (r *failingReadCloser) Close() error {
+	return nil
+}
+
+var _ fs.Object = (*retryOpenChunk)(nil)

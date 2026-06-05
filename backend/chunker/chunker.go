@@ -2370,7 +2370,7 @@ func (r *linearReader) nextChunk(offset int64) (int64, error) {
 		return -1, err
 	}
 
-	reader, err := chunk.Open(r.ctx, options...)
+	reader, err := operations.Open(r.ctx, chunk, options...)
 	if err != nil {
 		return -1, err
 	}
