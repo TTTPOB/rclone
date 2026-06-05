@@ -29,6 +29,32 @@ var (
 	UploadKilobytes = flag.Int("upload-kilobytes", 0, "Upload size in Kilobytes, set this to test large uploads")
 )
 
+func TestChunkerRetrySpoolOptions(t *testing.T) {
+	ri, err := fs.Find("chunker")
+	require.NoError(t, err)
+
+	retryChunks := ri.Options.Get("retry_chunks")
+	require.NotNil(t, retryChunks)
+	assert.Equal(t, false, retryChunks.Default)
+	assert.True(t, retryChunks.Advanced)
+	assert.Contains(t, retryChunks.Help, "--low-level-retries")
+
+	spoolThreshold := ri.Options.Get("spool_threshold")
+	require.NotNil(t, spoolThreshold)
+	assert.Equal(t, fs.Gibi, spoolThreshold.Default)
+	assert.True(t, spoolThreshold.Advanced)
+	assert.Contains(t, spoolThreshold.Help, "cached in memory")
+	assert.Contains(t, spoolThreshold.Help, "temporary file")
+
+	spoolDir := ri.Options.Get("spool_dir")
+	require.NotNil(t, spoolDir)
+	assert.Equal(t, "", spoolDir.Default)
+	assert.True(t, spoolDir.Advanced)
+	assert.Contains(t, spoolDir.Help, "--temp-dir")
+	assert.Contains(t, spoolDir.Help, "tmpfs")
+	assert.Contains(t, spoolDir.Help, "RAM")
+}
+
 // test that chunking does not break large uploads
 func testPutLarge(t *testing.T, f *Fs, kilobytes int) {
 	t.Run(fmt.Sprintf("PutLarge%dk", kilobytes), func(t *testing.T) {

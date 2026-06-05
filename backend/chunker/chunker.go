@@ -267,6 +267,31 @@ If meta format is set to "none", rename transactions will always be used.
 This method is EXPERIMENTAL, don't use on production systems.`,
 				},
 			},
+		}, {
+			Name:     "retry_chunks",
+			Advanced: true,
+			Default:  false,
+			Help: `Retry data chunk uploads.
+
+When enabled, chunker retries individual data chunk uploads using the global
+--low-level-retries setting.`,
+		}, {
+			Name:     "spool_threshold",
+			Advanced: true,
+			Default:  fs.Gibi,
+			Help: `Memory threshold for chunk retry replay cache.
+
+When chunk retry is enabled, replay data is cached in memory until this
+threshold is exceeded, then moved to a temporary file.`,
+		}, {
+			Name:     "spool_dir",
+			Advanced: true,
+			Default:  "",
+			Help: `Directory for chunk retry temporary files.
+
+When empty, chunker uses the global --temp-dir setting.
+If the global /tmp or the specified directory is tmpfs, spilled replay cache
+still consumes RAM.`,
 		}},
 	})
 }
@@ -364,14 +389,17 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 
 // Options defines the configuration for this backend
 type Options struct {
-	Remote       string        `config:"remote"`
-	ChunkSize    fs.SizeSuffix `config:"chunk_size"`
-	NameFormat   string        `config:"name_format"`
-	StartFrom    int           `config:"start_from"`
-	MetaFormat   string        `config:"meta_format"`
-	HashType     string        `config:"hash_type"`
-	FailHard     bool          `config:"fail_hard"`
-	Transactions string        `config:"transactions"`
+	Remote         string        `config:"remote"`
+	ChunkSize      fs.SizeSuffix `config:"chunk_size"`
+	NameFormat     string        `config:"name_format"`
+	StartFrom      int           `config:"start_from"`
+	MetaFormat     string        `config:"meta_format"`
+	HashType       string        `config:"hash_type"`
+	FailHard       bool          `config:"fail_hard"`
+	Transactions   string        `config:"transactions"`
+	RetryChunks    bool          `config:"retry_chunks"`
+	SpoolThreshold fs.SizeSuffix `config:"spool_threshold"`
+	SpoolDir       string        `config:"spool_dir"`
 }
 
 // Fs represents a wrapped fs.Fs
