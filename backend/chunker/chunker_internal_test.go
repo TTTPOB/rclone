@@ -111,6 +111,23 @@ type multipartTrackingPutCall struct {
 	seekable bool
 }
 
+type slowHashFs struct {
+	fs.Fs
+	features *fs.Features
+}
+
+type hashTrackingObjectInfo struct {
+	fs.Object
+	mu    sync.Mutex
+	calls []hash.Type
+	sums  map[hash.Type]string
+}
+
+type hashTrackingObject struct {
+	fs.Object
+	info *hashTrackingObjectInfo
+}
+
 func newFailPutFs(base fs.Fs, failRemote string, failErr error) *failPutFs {
 	f := &failPutFs{
 		Fs:         base,
@@ -119,6 +136,23 @@ func newFailPutFs(base fs.Fs, failRemote string, failErr error) *failPutFs {
 	}
 	f.features = base.Features().Wrap(f)
 	return f
+}
+
+func newSlowHashFs(base fs.Fs) *slowHashFs {
+	f := &slowHashFs{
+		Fs: base,
+	}
+	f.features = base.Features().Wrap(f)
+	f.features.SlowHash = true
+	return f
+}
+
+func (f *slowHashFs) Features() *fs.Features {
+	return f.features
+}
+
+func (f *slowHashFs) UnWrap() fs.Fs {
+	return f.Fs
 }
 
 func (f *failPutFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
@@ -149,6 +183,46 @@ func (f *trackingPutFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo
 		size:    src.Size(),
 	})
 	return object.NewMemoryObject(src.Remote(), src.ModTime(ctx), buf).SetFs(f), nil
+}
+
+func newHashTrackingObjectInfo(remote string, size int64, sourceFs fs.Fs, sums map[hash.Type]string) *hashTrackingObjectInfo {
+	base := object.NewMemoryObject(remote, mtime1, make([]byte, int(size))).SetFs(sourceFs)
+	info := &hashTrackingObjectInfo{
+		sums: sums,
+	}
+	info.Object = &hashTrackingObject{
+		Object: base,
+		info:   info,
+	}
+	return info
+}
+
+func (i *hashTrackingObjectInfo) Hash(ctx context.Context, h hash.Type) (string, error) {
+	i.mu.Lock()
+	i.calls = append(i.calls, h)
+	i.mu.Unlock()
+	if sum, ok := i.sums[h]; ok {
+		return sum, nil
+	}
+	return "", hash.ErrUnsupported
+}
+
+func (i *hashTrackingObjectInfo) HashCalls() []hash.Type {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return append([]hash.Type(nil), i.calls...)
+}
+
+func (i *hashTrackingObjectInfo) UnWrap() fs.Object {
+	return i.Object
+}
+
+func (o *hashTrackingObject) Hash(ctx context.Context, h hash.Type) (string, error) {
+	return o.info.Hash(ctx, h)
+}
+
+func (o *hashTrackingObject) UnWrap() fs.Object {
+	return o.Object
 }
 
 func newBlockingPutFs() *blockingPutFs {
@@ -494,6 +568,16 @@ func newTestChunkerChunkWriterWithBase(t *testing.T, base fs.Fs, remote string, 
 	f := newTestChunkerFsWithBase(t, ctx, base, "none")
 
 	src := object.NewStaticObjectInfo(remote, mtime1, size, true, nil, nil)
+	writer, err := f.newChunkerChunkWriter(ctx, remote, src)
+	require.NoError(t, err)
+	return writer
+}
+
+func newTestChunkerChunkWriterWithSource(t *testing.T, base fs.Fs, hashType, remote string, src fs.ObjectInfo) *chunkerChunkWriter {
+	t.Helper()
+	ctx := context.Background()
+	f := newTestChunkerFsWithBase(t, ctx, base, hashType)
+
 	writer, err := f.newChunkerChunkWriter(ctx, remote, src)
 	require.NoError(t, err)
 	return writer
@@ -1149,6 +1233,228 @@ func TestChunkerChunkWriterCloseCommitsMultiChunkObject(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(10), obj.Size())
 	assert.Equal(t, "abcdefghij", fstests.ReadObject(ctx, t, obj, -1))
+}
+
+func TestChunkerChunkWriterHashMD5UsesSourceHash(t *testing.T) {
+	ctx := context.Background()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+
+	src := newHashTrackingObjectInfo("file.txt", 8, object.MemoryFs, map[hash.Type]string{
+		hash.MD5: "e2fc714c4727ee9395f324cd2e7f331f",
+	})
+	writer := newTestChunkerChunkWriterWithSource(t, base, "md5", "file.txt", src)
+
+	_, err = writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+	require.NoError(t, err)
+	_, err = writer.WriteChunk(ctx, 1, strings.NewReader("efgh"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close(ctx))
+
+	obj, err := writer.f.NewObject(ctx, "file.txt")
+	require.NoError(t, err)
+	sum, err := obj.Hash(ctx, hash.MD5)
+	require.NoError(t, err)
+	assert.Equal(t, "e2fc714c4727ee9395f324cd2e7f331f", sum)
+	assert.Equal(t, []hash.Type{hash.MD5}, src.HashCalls())
+}
+
+func TestChunkerChunkWriterHashMD5SlowSourceSkipsPreHash(t *testing.T) {
+	ctx := context.Background()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+
+	srcFs := newSlowHashFs(object.MemoryFs)
+	src := newHashTrackingObjectInfo("file.txt", 8, srcFs, map[hash.Type]string{
+		hash.MD5: "00000000000000000000000000000000",
+	})
+	chunkerFs := newTestChunkerFsWithBase(t, ctx, base, "md5")
+	writer, err := chunkerFs.newChunkerChunkWriter(ctx, "file.txt", chunkerFs.wrapInfo(src, "file.txt", src.Size()))
+	require.NoError(t, err)
+
+	_, err = writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+	require.NoError(t, err)
+	_, err = writer.WriteChunk(ctx, 1, strings.NewReader("efgh"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close(ctx))
+
+	obj, err := writer.f.NewObject(ctx, "file.txt")
+	require.NoError(t, err)
+	sum, err := obj.Hash(ctx, hash.MD5)
+	require.NoError(t, err)
+	assert.Equal(t, "e8dc4081b13434b45189a720b77b6818", sum)
+	assert.Empty(t, src.HashCalls())
+}
+
+func TestChunkerChunkWriterHashCalculatedFallback(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name     string
+		hashType string
+		sumType  hash.Type
+		sum      string
+	}{
+		{
+			name:     "MD5",
+			hashType: "md5",
+			sumType:  hash.MD5,
+			sum:      "e8dc4081b13434b45189a720b77b6818",
+		}, {
+			name:     "SHA1",
+			hashType: "sha1",
+			sumType:  hash.SHA1,
+			sum:      "425af12a0743502b322e93a015bcf868e324d56a",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base, err := fs.TemporaryLocalFs(ctx)
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				assert.NoError(t, operations.Purge(ctx, base, ""))
+			})
+
+			src := newHashTrackingObjectInfo("file.txt", 8, object.MemoryFs, nil)
+			writer := newTestChunkerChunkWriterWithSource(t, base, test.hashType, "file.txt", src)
+
+			_, err = writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+			require.NoError(t, err)
+			_, err = writer.WriteChunk(ctx, 1, strings.NewReader("efgh"))
+			require.NoError(t, err)
+			require.NoError(t, writer.Close(ctx))
+
+			obj, err := writer.f.NewObject(ctx, "file.txt")
+			require.NoError(t, err)
+			sum, err := obj.Hash(ctx, test.sumType)
+			require.NoError(t, err)
+			assert.Equal(t, test.sum, sum)
+			assert.Equal(t, []hash.Type{test.sumType}, src.HashCalls())
+		})
+	}
+}
+
+func TestChunkerChunkWriterHashForcedConcurrentOrdered(t *testing.T) {
+	ctx := context.Background()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+
+	src := newHashTrackingObjectInfo("file.txt", 8, object.MemoryFs, nil)
+	writer := newTestChunkerChunkWriterWithSource(t, base, "md5", "file.txt", src)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := writer.WriteChunk(ctx, 1, strings.NewReader("efgh"))
+		errs <- err
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+		errs <- err
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.NoError(t, writer.Close(ctx))
+
+	obj, err := writer.f.NewObject(ctx, "file.txt")
+	require.NoError(t, err)
+	sum, err := obj.Hash(ctx, hash.MD5)
+	require.NoError(t, err)
+	assert.Equal(t, "e8dc4081b13434b45189a720b77b6818", sum)
+	assert.Equal(t, []hash.Type{hash.MD5}, src.HashCalls())
+}
+
+func TestChunkerChunkWriterHashMD5QuickFallbackWritesSHA1(t *testing.T) {
+	ctx := context.Background()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+
+	src := newHashTrackingObjectInfo("file.txt", 8, object.MemoryFs, map[hash.Type]string{
+		hash.SHA1: "425af12a0743502b322e93a015bcf868e324d56a",
+	})
+	writer := newTestChunkerChunkWriterWithSource(t, base, "md5quick", "file.txt", src)
+
+	_, err = writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+	require.NoError(t, err)
+	_, err = writer.WriteChunk(ctx, 1, strings.NewReader("efgh"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close(ctx))
+
+	obj, err := writer.f.NewObject(ctx, "file.txt")
+	require.NoError(t, err)
+	md5sum, err := obj.Hash(ctx, hash.MD5)
+	require.NoError(t, err)
+	assert.Empty(t, md5sum)
+	sha1sum, err := obj.Hash(ctx, hash.SHA1)
+	require.NoError(t, err)
+	assert.Equal(t, "425af12a0743502b322e93a015bcf868e324d56a", sha1sum)
+	assert.Equal(t, []hash.Type{hash.MD5, hash.SHA1}, src.HashCalls())
+}
+
+func TestChunkerChunkWriterHashMD5AllSmallAndZeroByte(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name    string
+		content string
+		md5     string
+	}{
+		{
+			name:    "ZeroByte",
+			content: "",
+			md5:     "d41d8cd98f00b204e9800998ecf8427e",
+		}, {
+			name:    "Small",
+			content: "-",
+			md5:     "336d5ebc5436534e61d16e63ddfca327",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base, err := fs.TemporaryLocalFs(ctx)
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				assert.NoError(t, operations.Purge(ctx, base, ""))
+			})
+
+			slowBase := newSlowHashFs(base)
+			src := object.NewStaticObjectInfo("file.txt", mtime1, int64(len(test.content)), true, nil, nil)
+			writer := newTestChunkerChunkWriterWithSource(t, slowBase, "md5all", "file.txt", src)
+
+			_, err = writer.WriteChunk(ctx, 0, strings.NewReader(test.content))
+			require.NoError(t, err)
+			require.NoError(t, writer.Close(ctx))
+
+			obj, err := writer.f.NewObject(ctx, "file.txt")
+			require.NoError(t, err)
+			sum, err := obj.Hash(ctx, hash.MD5)
+			require.NoError(t, err)
+			assert.Equal(t, test.md5, sum)
+
+			entries, err := base.List(ctx, "")
+			require.NoError(t, err)
+			assert.Len(t, entries, 2)
+			_, err = base.NewObject(ctx, "file.txt")
+			assert.NoError(t, err, "metadata must be created")
+			chunk, err := base.NewObject(ctx, "file.txt.rclone_chunk.001")
+			require.NoError(t, err, "first chunk must be created")
+			assert.Equal(t, int64(len(test.content)), chunk.Size())
+		})
+	}
 }
 
 func TestChunkerChunkWriterCloseRejectsMissingChunk(t *testing.T) {

@@ -1273,9 +1273,10 @@ func (f *Fs) put(
 	st.md5 = c.md5
 	st.sha1 = c.sha1
 
-	obj, err = f.finalizeUpload(ctx, st, basePut, func() {
+	obj, err = f.finalizeUpload(ctx, st, basePut, func() error {
 		c.updateHashes()
 		st.md5, st.sha1 = c.md5, c.sha1
+		return nil
 	})
 	return obj, err
 }
@@ -1304,7 +1305,7 @@ func (f *Fs) finalizeUpload(
 	ctx context.Context,
 	st *chunkerUploadState,
 	basePut putFn,
-	updateHashes func(),
+	updateHashes func() error,
 ) (fs.Object, error) {
 	// Validate uploaded size
 	if st.sizeTotal != -1 && st.readCount != st.sizeTotal {
@@ -1381,7 +1382,9 @@ func (f *Fs) finalizeUpload(
 	var metadata []byte
 	switch f.opt.MetaFormat {
 	case "simplejson":
-		updateHashes()
+		if err = updateHashes(); err != nil {
+			break
+		}
 		metadata, err = marshalSimpleJSON(ctx, sizeTotal, len(st.chunks), st.md5, st.sha1, st.xactID)
 	}
 	if err == nil {
@@ -1426,6 +1429,7 @@ type chunkerChunkWriter struct {
 	st          *chunkerUploadState
 	basePut     putFn
 	options     []fs.OpenOption
+	hasher      gohash.Hash
 	chunkSize   int64
 	sizeKnown   bool
 	sizeWritten int64
@@ -1455,6 +1459,7 @@ func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.Ob
 		return nil, err
 	}
 
+	hasher, md5sum, sha1sum := f.prepareChunkWriterHashes(ctx, src)
 	w := &chunkerChunkWriter{
 		ctx: ctx,
 		f:   f,
@@ -1463,9 +1468,12 @@ func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.Ob
 			remote:    remote,
 			sizeTotal: sizeTotal,
 			xactID:    xactID,
+			md5:       md5sum,
+			sha1:      sha1sum,
 		},
 		basePut:   f.base.Put,
 		options:   append([]fs.OpenOption(nil), options...),
+		hasher:    hasher,
 		chunkSize: int64(f.opt.ChunkSize),
 		sizeKnown: sizeKnown,
 		written:   make(map[int]fs.Object),
@@ -1473,6 +1481,81 @@ func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.Ob
 	}
 	w.cond = sync.NewCond(&w.mu)
 	return w, nil
+}
+
+func (f *Fs) prepareChunkWriterHashes(ctx context.Context, src fs.ObjectInfo) (gohash.Hash, string, string) {
+	hashSrc := chunkWriterHashSource(src)
+	switch {
+	case f.useMD5:
+		srcObj := fs.UnWrapObjectInfo(hashSrc)
+		if srcObj != nil && srcObj.Fs().Features().SlowHash {
+			fs.Debugf(src, "skip slow MD5 on source file, hashing from uploaded chunks")
+			return md5.New(), "", ""
+		}
+		if md5sum, _ := hashSrc.Hash(ctx, hash.MD5); md5sum != "" {
+			return nil, md5sum, ""
+		}
+		if f.hashFallback {
+			sha1sum, _ := hashSrc.Hash(ctx, hash.SHA1)
+			return nil, "", sha1sum
+		}
+		return md5.New(), "", ""
+	case f.useSHA1:
+		srcObj := fs.UnWrapObjectInfo(hashSrc)
+		if srcObj != nil && srcObj.Fs().Features().SlowHash {
+			fs.Debugf(src, "skip slow SHA1 on source file, hashing from uploaded chunks")
+			return sha1.New(), "", ""
+		}
+		if sha1sum, _ := hashSrc.Hash(ctx, hash.SHA1); sha1sum != "" {
+			return nil, "", sha1sum
+		}
+		if f.hashFallback {
+			md5sum, _ := hashSrc.Hash(ctx, hash.MD5)
+			return nil, md5sum, ""
+		}
+		return sha1.New(), "", ""
+	default:
+		return nil, "", ""
+	}
+}
+
+func chunkWriterHashSource(src fs.ObjectInfo) fs.ObjectInfo {
+	if wrapped, ok := src.(*ObjectInfo); ok {
+		return wrapped.src
+	}
+	return src
+}
+
+func (w *chunkerChunkWriter) updateHashesFromChunks(ctx context.Context) error {
+	if w.hasher == nil {
+		return nil
+	}
+
+	w.hasher.Reset()
+	// Multipart currently asks chunker for Concurrency=1, but direct writer callers
+	// can still finish chunks out of order, so hash from stored chunks by number.
+	for _, chunk := range w.st.chunks {
+		reader, err := chunk.Open(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(w.hasher, reader)
+		closeErr := reader.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+
+	switch {
+	case w.f.useMD5:
+		w.st.md5 = hex.EncodeToString(w.hasher.Sum(nil))
+	case w.f.useSHA1:
+		w.st.sha1 = hex.EncodeToString(w.hasher.Sum(nil))
+	}
+	return nil
 }
 
 // OpenChunkWriter opens a chunked writer for hash-free chunker uploads.
@@ -1742,7 +1825,9 @@ func (w *chunkerChunkWriter) Close(ctx context.Context) error {
 	w.cond.Broadcast()
 	w.mu.Unlock()
 
-	_, err := w.f.finalizeUpload(ctx, w.st, w.basePut, func() {})
+	_, err := w.f.finalizeUpload(ctx, w.st, w.basePut, func() error {
+		return w.updateHashesFromChunks(ctx)
+	})
 	if err != nil {
 		w.mu.Lock()
 		w.closing = false
