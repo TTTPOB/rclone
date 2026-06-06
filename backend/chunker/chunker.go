@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -342,8 +341,8 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 
 	// Note 1: the features here are ones we could support, and they are
 	// ANDed with the ones from wrappedFs.
-	// Note 2: features.Fill() points features.PutStream to our PutStream,
-	// but features.Mask() will nullify it if wrappedFs does not have it.
+	// Note 2: PutStream and OpenChunkWriter are provided by chunker itself,
+	// so they are restored after Mask regardless of wrappedFs features.
 	f.features = (&fs.Features{
 		CaseInsensitive:          true,
 		DuplicateFiles:           true,
@@ -361,12 +360,8 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 
 	f.features.ListR = nil // Recursive listing may cause chunker skip files
 	f.features.ListP = nil // ListP not supported yet
-	if opt.HashType == "none" {
-		f.features.OpenChunkWriter = f.OpenChunkWriter
-		f.features.PutStream = f.PutStream
-	} else {
-		f.features.OpenChunkWriter = nil
-	}
+	f.features.OpenChunkWriter = f.OpenChunkWriter
+	f.features.PutStream = f.PutStream
 	f.features.DisableList(fs.GetConfig(ctx).DisableFeatures)
 
 	return f, err
@@ -1173,119 +1168,8 @@ func (f *Fs) checkUploadTarget(ctx context.Context, src fs.ObjectInfo, remote, a
 	return target, nil
 }
 
-// put implements Put, PutStream, PutUnchecked, Update
-func (f *Fs) put(
-	ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options []fs.OpenOption,
-	basePut putFn, action string, target fs.Object,
-) (obj fs.Object, err error) {
-	// Perform consistency checks
-	target, err = f.checkUploadTarget(ctx, src, remote, action, target)
-	if err != nil {
-		return nil, err
-	}
-
-	// Prepare to upload
-	c := f.newChunkingReader(src)
-	wrapIn := c.wrapStream(ctx, in, src)
-
-	baseRemote := remote
-	st := &chunkerUploadState{
-		src:    src,
-		remote: baseRemote,
-	}
-	defer func() {
-		if err != nil {
-			st.rollback(ctx)
-		}
-	}()
-
-	xactID, errXact := f.newXactID(ctx, baseRemote)
-	if errXact != nil {
-		return nil, errXact
-	}
-	st.xactID = xactID
-
-	// Transfer chunks data
-	for c.chunkNo = 0; !c.done; c.chunkNo++ {
-		if c.chunkNo > maxSafeChunkNumber {
-			return nil, ErrChunkOverflow
-		}
-
-		tempRemote := f.makeChunkName(baseRemote, c.chunkNo, "", xactID)
-		size := min(c.sizeLeft, c.chunkSize)
-		savedReadCount := c.readCount
-
-		// If a single chunk is expected, avoid the extra rename operation
-		chunkRemote := tempRemote
-		if c.expectSingle && c.chunkNo == 0 && optimizeFirstChunk {
-			chunkRemote = baseRemote
-		}
-		info := f.wrapInfo(src, chunkRemote, size)
-
-		// Refill chunkLimit and let basePut repeatedly call chunkingReader.Read()
-		c.chunkLimit = c.chunkSize
-		// TODO: handle range/limit options
-		chunk, errChunk := basePut(ctx, wrapIn, info, options...)
-		if errChunk != nil {
-			return nil, errChunk
-		}
-
-		if size > 0 && c.readCount == savedReadCount && c.expectSingle {
-			// basePut returned success but didn't call chunkingReader's Read.
-			// This is possible if wrapped remote has performed the put by hash
-			// because chunker bridges Hash from source for non-chunked files.
-			// Hence, force Read here to update accounting and hashsums.
-			if err := c.dummyRead(wrapIn, size); err != nil {
-				return nil, err
-			}
-		}
-		if c.sizeLeft == 0 && !c.done {
-			// The file has been apparently put by hash, force completion.
-			c.done = true
-		}
-
-		// Expected a single chunk but more to come, so name it as usual.
-		if !c.done && chunkRemote != tempRemote {
-			fs.Infof(chunk, "Expected single chunk, got more")
-			chunkMoved, errMove := f.baseMove(ctx, chunk, tempRemote, delFailed)
-			if errMove != nil {
-				silentlyRemove(ctx, chunk)
-				return nil, errMove
-			}
-			chunk = chunkMoved
-		}
-
-		// Wrapped remote may or may not have seen EOF from chunking reader,
-		// e.g. the box multi-uploader reads exactly the chunk size specified
-		// and skips the "EOF" read. Hence, switch to next limit here.
-		if !(c.chunkLimit == 0 || c.chunkLimit == c.chunkSize || c.sizeTotal == -1 || c.done) {
-			silentlyRemove(ctx, chunk)
-			return nil, fmt.Errorf("destination ignored %d data bytes", c.chunkLimit)
-		}
-		c.chunkLimit = c.chunkSize
-
-		st.chunks = append(st.chunks, chunk)
-	}
-
-	st.readCount = c.readCount
-	st.sizeTotal = c.sizeTotal
-	st.smallHead = c.smallHead
-	st.md5 = c.md5
-	st.sha1 = c.sha1
-
-	obj, err = f.finalizeUpload(ctx, st, basePut, func() error {
-		c.updateHashes()
-		st.md5, st.sha1 = c.md5, c.sha1
-		return nil
-	})
-	return obj, err
-}
-
-// putMultipart implements the writer-centered hash_type=none upload path.
+// putMultipart implements the writer-centered upload path.
 func (f *Fs) putMultipart(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options []fs.OpenOption, action string, target fs.Object) (fs.Object, error) {
-	if f.opt.HashType != "none" {
-		return nil, fmt.Errorf("multipart %s requires hash_type none: %w", action, fs.ErrorNotImplemented)
-	}
 	if _, err := f.checkUploadTarget(ctx, src, remote, action, target); err != nil {
 		return nil, err
 	}
@@ -1349,6 +1233,25 @@ func (f *Fs) finalizeUpload(
 		return nil, fmt.Errorf("incorrect chunks size %d != %d", sizeTotal, st.readCount)
 	}
 
+	var metadata []byte
+	if f.useMeta {
+		var err error
+		metadataXactID := st.xactID
+		if !f.useNoRename {
+			metadataXactID = ""
+		}
+		switch f.opt.MetaFormat {
+		case "simplejson":
+			if err = updateHashes(); err != nil {
+				return nil, err
+			}
+			metadata, err = marshalSimpleJSON(ctx, sizeTotal, len(st.chunks), st.md5, st.sha1, metadataXactID)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// If previous object was chunked, remove its chunks
 	f.removeOldChunks(ctx, st.remote)
 
@@ -1379,18 +1282,8 @@ func (f *Fs) finalizeUpload(
 
 	// Update meta object
 	var err error
-	var metadata []byte
-	switch f.opt.MetaFormat {
-	case "simplejson":
-		if err = updateHashes(); err != nil {
-			break
-		}
-		metadata, err = marshalSimpleJSON(ctx, sizeTotal, len(st.chunks), st.md5, st.sha1, st.xactID)
-	}
-	if err == nil {
-		metaInfo := f.wrapInfo(st.src, st.remote, int64(len(metadata)))
-		st.metaObject, err = basePut(ctx, bytes.NewReader(metadata), metaInfo)
-	}
+	metaInfo := f.wrapInfo(st.src, st.remote, int64(len(metadata)))
+	st.metaObject, err = basePut(ctx, bytes.NewReader(metadata), metaInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -1422,7 +1315,7 @@ func (u chunkerMultipartUpload) OpenChunkWriter(ctx context.Context, remote stri
 	return info, chunkWriter, nil
 }
 
-// chunkerChunkWriter is hidden scaffolding for a future OpenChunkWriter path.
+// chunkerChunkWriter writes chunker uploads through fs.OpenChunkWriter.
 type chunkerChunkWriter struct {
 	ctx         context.Context
 	f           *Fs
@@ -1558,11 +1451,8 @@ func (w *chunkerChunkWriter) updateHashesFromChunks(ctx context.Context) error {
 	return nil
 }
 
-// OpenChunkWriter opens a chunked writer for hash-free chunker uploads.
+// OpenChunkWriter opens a chunked writer for chunker uploads.
 func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
-	if f.opt.HashType != "none" {
-		return info, nil, fmt.Errorf("chunk writer requires hash_type none: %w", fs.ErrorNotImplemented)
-	}
 	if parentPath, _, _, _ := f.parseChunkName(remote); parentPath != "" {
 		return info, nil, fmt.Errorf("chunk writer refused: chunk overlap with %q", parentPath)
 	}
@@ -1897,151 +1787,6 @@ type chunkerUploadState struct {
 	xactID     string
 }
 
-type chunkingReader struct {
-	baseReader   io.Reader
-	sizeTotal    int64
-	sizeLeft     int64
-	readCount    int64
-	chunkSize    int64
-	chunkLimit   int64
-	chunkNo      int
-	err          error
-	done         bool
-	expectSingle bool
-	smallHead    []byte
-	fs           *Fs
-	hasher       gohash.Hash
-	md5          string
-	sha1         string
-}
-
-func (f *Fs) newChunkingReader(src fs.ObjectInfo) *chunkingReader {
-	c := &chunkingReader{
-		fs:        f,
-		chunkSize: int64(f.opt.ChunkSize),
-		sizeTotal: src.Size(),
-	}
-	c.chunkLimit = c.chunkSize
-	c.sizeLeft = c.sizeTotal
-	c.expectSingle = c.sizeTotal >= 0 && c.sizeTotal <= c.chunkSize
-	return c
-}
-
-func (c *chunkingReader) wrapStream(ctx context.Context, in io.Reader, src fs.ObjectInfo) io.Reader {
-	baseIn, wrapBack := accounting.UnWrap(in)
-
-	switch {
-	case c.fs.useMD5:
-		srcObj := fs.UnWrapObjectInfo(src)
-		if srcObj != nil && srcObj.Fs().Features().SlowHash {
-			fs.Debugf(src, "skip slow MD5 on source file, hashing in-transit")
-			c.hasher = md5.New()
-			break
-		}
-		if c.md5, _ = src.Hash(ctx, hash.MD5); c.md5 == "" {
-			if c.fs.hashFallback {
-				c.sha1, _ = src.Hash(ctx, hash.SHA1)
-			} else {
-				c.hasher = md5.New()
-			}
-		}
-	case c.fs.useSHA1:
-		srcObj := fs.UnWrapObjectInfo(src)
-		if srcObj != nil && srcObj.Fs().Features().SlowHash {
-			fs.Debugf(src, "skip slow SHA1 on source file, hashing in-transit")
-			c.hasher = sha1.New()
-			break
-		}
-		if c.sha1, _ = src.Hash(ctx, hash.SHA1); c.sha1 == "" {
-			if c.fs.hashFallback {
-				c.md5, _ = src.Hash(ctx, hash.MD5)
-			} else {
-				c.hasher = sha1.New()
-			}
-		}
-	}
-
-	if c.hasher != nil {
-		baseIn = io.TeeReader(baseIn, c.hasher)
-	}
-	c.baseReader = baseIn
-	return wrapBack(c)
-}
-
-func (c *chunkingReader) updateHashes() {
-	if c.hasher == nil {
-		return
-	}
-	switch {
-	case c.fs.useMD5:
-		c.md5 = hex.EncodeToString(c.hasher.Sum(nil))
-	case c.fs.useSHA1:
-		c.sha1 = hex.EncodeToString(c.hasher.Sum(nil))
-	}
-}
-
-// Note: Read is not called if wrapped remote performs put by hash.
-func (c *chunkingReader) Read(buf []byte) (bytesRead int, err error) {
-	if c.chunkLimit <= 0 {
-		// Chunk complete - switch to next one.
-		// Note #1:
-		// We might not get here because some remotes (e.g. box multi-uploader)
-		// read the specified size exactly and skip the concluding EOF Read.
-		// Then a check in the put loop will kick in.
-		// Note #2:
-		// The crypt backend after receiving EOF here will call Read again
-		// and we must insist on returning EOF, so we postpone refilling
-		// chunkLimit to the main loop.
-		return 0, io.EOF
-	}
-	if int64(len(buf)) > c.chunkLimit {
-		buf = buf[0:c.chunkLimit]
-	}
-	bytesRead, err = c.baseReader.Read(buf)
-	if err != nil && err != io.EOF {
-		c.err = err
-		c.done = true
-		return
-	}
-	c.accountBytes(int64(bytesRead))
-	if c.chunkNo == 0 && c.expectSingle && bytesRead > 0 && c.readCount <= maxMetadataSize {
-		c.smallHead = append(c.smallHead, buf[:bytesRead]...)
-	}
-	if bytesRead == 0 && c.sizeLeft == 0 {
-		err = io.EOF // Force EOF when no data left.
-	}
-	if err == io.EOF {
-		c.done = true
-	}
-	return
-}
-
-func (c *chunkingReader) accountBytes(bytesRead int64) {
-	c.readCount += bytesRead
-	c.chunkLimit -= bytesRead
-	if c.sizeLeft != -1 {
-		c.sizeLeft -= bytesRead
-	}
-}
-
-// dummyRead updates accounting, hashsums, etc. by simulating reads
-func (c *chunkingReader) dummyRead(in io.Reader, size int64) error {
-	if c.hasher == nil && c.readCount+size > maxMetadataSize {
-		c.accountBytes(size)
-		return nil
-	}
-	const bufLen = 1048576 // 1 MiB
-	buf := make([]byte, bufLen)
-	for size > 0 {
-		n := min(size, bufLen)
-		if _, err := io.ReadFull(in, buf[0:n]); err != nil {
-			return err
-		}
-		size -= n
-	}
-	return nil
-}
-
 // rollback removes uploaded temporary chunks
 func (st *chunkerUploadState) rollback(ctx context.Context) {
 	if st.metaObject != nil {
@@ -2075,37 +1820,17 @@ func (f *Fs) removeOldChunks(ctx context.Context, remote string) {
 // will return the object and the error, otherwise will return
 // nil and the error
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	if f.opt.HashType == "none" {
-		return f.putMultipart(ctx, in, src, src.Remote(), options, "put", nil)
-	}
-	return f.put(ctx, in, src, src.Remote(), options, f.base.Put, "put", nil)
+	return f.putMultipart(ctx, in, src, src.Remote(), options, "put", nil)
 }
 
 // PutStream uploads to the remote path with the modTime given of indeterminate size
 func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	if f.opt.HashType == "none" {
-		return f.putMultipart(ctx, in, src, src.Remote(), options, "upload", nil)
-	}
-	return f.put(ctx, in, src, src.Remote(), options, f.base.Features().PutStream, "upload", nil)
+	return f.putMultipart(ctx, in, src, src.Remote(), options, "upload", nil)
 }
 
 // Update in to the object with the modTime given of the given size
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	if o.f.opt.HashType == "none" {
-		oNew, err := o.f.putMultipart(ctx, in, src, o.Remote(), options, "update", o)
-		if err == nil {
-			*o = *oNew.(*Object)
-		}
-		return err
-	}
-	basePut := o.f.base.Put
-	if src.Size() < 0 {
-		basePut = o.f.base.Features().PutStream
-		if basePut == nil {
-			return errors.New("wrapped file system does not support streaming uploads")
-		}
-	}
-	oNew, err := o.f.put(ctx, in, src, o.Remote(), options, basePut, "update", o)
+	oNew, err := o.f.putMultipart(ctx, in, src, o.Remote(), options, "update", o)
 	if err == nil {
 		*o = *oNew.(*Object)
 	}
