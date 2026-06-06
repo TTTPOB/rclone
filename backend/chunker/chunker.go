@@ -26,10 +26,12 @@ import (
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/pacer"
 )
 
 // Chunker's composite files have one or more chunks
@@ -1438,7 +1440,22 @@ func (w *chunkerChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 
 	chunkRemote := w.f.makeChunkName(w.st.remote, chunkNumber, "", w.st.xactID)
 	chunkInfo := w.f.wrapInfo(w.st.src, chunkRemote, chunkSize)
-	chunk, err := w.basePut(ctx, reader, chunkInfo, w.options...)
+	var chunk fs.Object
+	err = fs.NewPacer(ctx, pacer.NewDefault()).Call(func() (bool, error) {
+		if _, err := reader.Seek(0, io.SeekStart); err != nil {
+			return false, fmt.Errorf("failed to seek chunk: %w", err)
+		}
+
+		var err error
+		chunk, err = w.basePut(ctx, reader, chunkInfo, w.options...)
+		if err == nil {
+			return false, nil
+		}
+
+		w.cleanupFailedChunk(ctx, chunkRemote, chunk)
+		chunk = nil
+		return shouldRetryChunkWriterPut(ctx, err)
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -1460,6 +1477,51 @@ func (w *chunkerChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 	}
 
 	return chunkSize, nil
+}
+
+func shouldRetryChunkWriterPut(ctx context.Context, err error) (bool, error) {
+	if err == nil {
+		return false, nil
+	}
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
+	if fserrors.IsNoRetryError(err) || fserrors.IsNoLowLevelRetryError(err) || fserrors.IsFatalError(err) {
+		return false, err
+	}
+	if _, ok := pacer.IsRetryAfter(err); ok {
+		return true, err
+	}
+	if retryAfter := fserrors.RetryAfterErrorTime(err); !retryAfter.IsZero() {
+		sleep := time.Until(retryAfter)
+		if sleep < 0 {
+			sleep = 0
+		}
+		return true, pacer.RetryAfterError(err, sleep)
+	}
+	if fserrors.IsRetryError(err) || fserrors.ShouldRetry(err) {
+		return true, err
+	}
+	return false, err
+}
+
+func (w *chunkerChunkWriter) cleanupFailedChunk(ctx context.Context, chunkRemote string, chunk fs.Object) {
+	if chunk != nil {
+		if err := chunk.Remove(ctx); err != nil {
+			fs.Errorf(chunk, "Failed to remove temporary chunk: %v", err)
+		}
+	}
+
+	chunk, err := w.f.base.NewObject(ctx, chunkRemote)
+	if err != nil {
+		if !errors.Is(err, fs.ErrorObjectNotFound) {
+			fs.Debugf(w.f.base, "Failed to check temporary chunk %q cleanup: %v", chunkRemote, err)
+		}
+		return
+	}
+	if err := chunk.Remove(ctx); err != nil {
+		fs.Errorf(chunk, "Failed to remove temporary chunk: %v", err)
+	}
 }
 
 // Close finalizes a hidden chunk writer upload.

@@ -15,6 +15,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
@@ -64,6 +65,26 @@ type trackingPutCall struct {
 	size    int64
 }
 
+type chunkWriterPutResult struct {
+	err          error
+	returnObject bool
+	storeObject  bool
+}
+
+type chunkWriterRetryPutFs struct {
+	fs.Fs
+	puts     []trackingPutCall
+	results  []chunkWriterPutResult
+	objects  map[string]*chunkWriterTestObject
+	removes  []string
+	features *fs.Features
+}
+
+type chunkWriterTestObject struct {
+	fs.Object
+	parent *chunkWriterRetryPutFs
+}
+
 func newFailPutFs(base fs.Fs, failRemote string, failErr error) *failPutFs {
 	f := &failPutFs{
 		Fs:         base,
@@ -100,6 +121,75 @@ func (f *trackingPutFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo
 		size:    src.Size(),
 	})
 	return object.NewMemoryObject(src.Remote(), src.ModTime(ctx), buf).SetFs(f), nil
+}
+
+func newChunkWriterRetryPutFs(results ...chunkWriterPutResult) *chunkWriterRetryPutFs {
+	f := &chunkWriterRetryPutFs{
+		Fs:      object.MemoryFs,
+		results: append([]chunkWriterPutResult(nil), results...),
+		objects: make(map[string]*chunkWriterTestObject),
+	}
+	f.features = object.MemoryFs.Features().Wrap(f)
+	return f
+}
+
+func (f *chunkWriterRetryPutFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	buf, err := io.ReadAll(in)
+	if err != nil {
+		return nil, err
+	}
+	f.puts = append(f.puts, trackingPutCall{
+		remote:  src.Remote(),
+		content: string(buf),
+		size:    src.Size(),
+	})
+
+	var result chunkWriterPutResult
+	if len(f.results) > 0 {
+		result = f.results[0]
+		f.results = f.results[1:]
+	}
+
+	obj := f.newObject(src.Remote(), buf)
+	if result.storeObject || result.err == nil {
+		f.objects[src.Remote()] = obj
+	}
+	if result.err != nil {
+		if result.returnObject {
+			return obj, result.err
+		}
+		return nil, result.err
+	}
+	return obj, nil
+}
+
+func (f *chunkWriterRetryPutFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	obj, ok := f.objects[remote]
+	if !ok {
+		return nil, fs.ErrorObjectNotFound
+	}
+	return obj, nil
+}
+
+func (f *chunkWriterRetryPutFs) Features() *fs.Features {
+	return f.features
+}
+
+func (f *chunkWriterRetryPutFs) UnWrap() fs.Fs {
+	return f.Fs
+}
+
+func (f *chunkWriterRetryPutFs) newObject(remote string, content []byte) *chunkWriterTestObject {
+	return &chunkWriterTestObject{
+		Object: object.NewMemoryObject(remote, mtime1, append([]byte(nil), content...)).SetFs(f),
+		parent: f,
+	}
+}
+
+func (o *chunkWriterTestObject) Remove(ctx context.Context) error {
+	o.parent.removes = append(o.parent.removes, o.Remote())
+	delete(o.parent.objects, o.Remote())
+	return nil
 }
 
 type failMoveCopyFs struct {
@@ -315,6 +405,12 @@ func newTestChunkerChunkWriterWithBase(t *testing.T, base fs.Fs, remote string, 
 	return writer
 }
 
+func newChunkWriterRetryTestContext(retries int) context.Context {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = retries
+	return ctx
+}
+
 func newTestLocalChunkerChunkWriter(t *testing.T, remote string, size int64) (*chunkerChunkWriter, fs.Fs) {
 	t.Helper()
 	ctx := context.Background()
@@ -394,6 +490,131 @@ func TestChunkerChunkWriterWriteChunkRejectsInvalidChunkNumber(t *testing.T) {
 			assert.Equal(t, int64(0), writer.st.readCount)
 		})
 	}
+}
+
+func TestChunkerChunkWriterWriteChunkRetriesSameChunk(t *testing.T) {
+	ctx := newChunkWriterRetryTestContext(2)
+	uploadErr := errors.New("temporary upload failure")
+	base := newChunkWriterRetryPutFs(chunkWriterPutResult{err: fserrors.RetryError(uploadErr)})
+	writer := newTestChunkerChunkWriterWithBase(t, base, "file.txt", 4)
+	wantRemote := writer.f.makeChunkName("file.txt", 0, "", writer.st.xactID)
+
+	n, err := writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), n)
+
+	require.Len(t, base.puts, 2)
+	for _, put := range base.puts {
+		assert.Equal(t, wantRemote, put.remote)
+		assert.Equal(t, "abcd", put.content)
+		assert.Equal(t, int64(4), put.size)
+	}
+
+	require.Len(t, writer.st.chunks, 1)
+	require.NotNil(t, writer.st.chunks[0])
+	assert.Equal(t, wantRemote, writer.st.chunks[0].Remote())
+	assert.Equal(t, writer.st.chunks[0], writer.written[0])
+	assert.Equal(t, int64(4), writer.st.readCount)
+	assert.Equal(t, int64(4), writer.sizeWritten)
+}
+
+func TestChunkerChunkWriterWriteChunkCleansFailedReturnedObject(t *testing.T) {
+	ctx := newChunkWriterRetryTestContext(2)
+	uploadErr := errors.New("temporary upload failure")
+	base := newChunkWriterRetryPutFs(chunkWriterPutResult{
+		err:          fserrors.RetryError(uploadErr),
+		returnObject: true,
+		storeObject:  true,
+	})
+	writer := newTestChunkerChunkWriterWithBase(t, base, "file.txt", 4)
+	wantRemote := writer.f.makeChunkName("file.txt", 0, "", writer.st.xactID)
+
+	n, err := writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), n)
+
+	require.Len(t, base.puts, 2)
+	assert.Equal(t, []string{wantRemote}, base.removes)
+	require.Len(t, writer.st.chunks, 1)
+	require.NotNil(t, writer.st.chunks[0])
+	assert.Same(t, base.objects[wantRemote], writer.st.chunks[0])
+	assert.Same(t, base.objects[wantRemote], writer.written[0])
+}
+
+func TestChunkerChunkWriterWriteChunkCleansFailedStoredObject(t *testing.T) {
+	ctx := newChunkWriterRetryTestContext(2)
+	uploadErr := errors.New("temporary upload failure")
+	base := newChunkWriterRetryPutFs(chunkWriterPutResult{
+		err:         fserrors.RetryError(uploadErr),
+		storeObject: true,
+	})
+	writer := newTestChunkerChunkWriterWithBase(t, base, "file.txt", 4)
+	wantRemote := writer.f.makeChunkName("file.txt", 0, "", writer.st.xactID)
+
+	n, err := writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), n)
+
+	require.Len(t, base.puts, 2)
+	assert.Equal(t, []string{wantRemote}, base.removes)
+	require.Len(t, writer.st.chunks, 1)
+	require.NotNil(t, writer.st.chunks[0])
+	assert.Same(t, base.objects[wantRemote], writer.st.chunks[0])
+	assert.Same(t, base.objects[wantRemote], writer.written[0])
+}
+
+func TestChunkerChunkWriterWriteChunkDoesNotRetryNoRetryErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "NoRetry",
+			err:  fserrors.NoRetryError(fserrors.RetryError(errors.New("do not retry"))),
+		},
+		{
+			name: "NoLowLevelRetry",
+			err:  fserrors.NoLowLevelRetryError(io.ErrUnexpectedEOF),
+		},
+		{
+			name: "Fatal",
+			err:  fserrors.FatalError(fserrors.RetryError(errors.New("fatal"))),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := newChunkWriterRetryTestContext(3)
+			base := newChunkWriterRetryPutFs(chunkWriterPutResult{err: test.err})
+			writer := newTestChunkerChunkWriterWithBase(t, base, "file.txt", 4)
+
+			_, err := writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+			require.Error(t, err)
+			assert.ErrorIs(t, err, test.err)
+			assert.Len(t, base.puts, 1)
+			assert.Empty(t, writer.st.chunks)
+			assert.Empty(t, writer.written)
+			assert.Zero(t, writer.st.readCount)
+			assert.Zero(t, writer.sizeWritten)
+		})
+	}
+}
+
+func TestChunkerChunkWriterWriteChunkDoesNotRetryContextCancellation(t *testing.T) {
+	ctx := newChunkWriterRetryTestContext(3)
+	ctx, cancel := context.WithCancel(ctx)
+	cancel()
+	uploadErr := errors.New("temporary upload failure")
+	base := newChunkWriterRetryPutFs(chunkWriterPutResult{err: fserrors.RetryError(uploadErr)})
+	writer := newTestChunkerChunkWriterWithBase(t, base, "file.txt", 4)
+
+	_, err := writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+	require.ErrorIs(t, err, uploadErr)
+	assert.Len(t, base.puts, 1)
+	assert.Empty(t, writer.st.chunks)
+	assert.Empty(t, writer.written)
+	assert.Zero(t, writer.st.readCount)
+	assert.Zero(t, writer.sizeWritten)
 }
 
 func TestChunkerChunkWriterCloseCommitsMultiChunkObject(t *testing.T) {
