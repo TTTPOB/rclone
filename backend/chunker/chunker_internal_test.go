@@ -140,6 +140,81 @@ func (f *failMoveCopyFs) UnWrap() fs.Fs {
 	return f.Fs
 }
 
+type failRemoveFs struct {
+	fs.Fs
+	failRemote  string
+	failErr     error
+	enabled     bool
+	features    *fs.Features
+	removeCalls []string
+}
+
+type failRemoveObject struct {
+	fs.Object
+	parent *failRemoveFs
+}
+
+func newFailRemoveFs(base fs.Fs, failRemote string, failErr error) *failRemoveFs {
+	f := &failRemoveFs{
+		Fs:         base,
+		failRemote: failRemote,
+		failErr:    failErr,
+	}
+	f.features = base.Features().Wrap(f)
+	return f
+}
+
+func (f *failRemoveFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	obj, err := f.Fs.NewObject(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+	return f.wrapObject(obj), nil
+}
+
+func (f *failRemoveFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	entries, err := f.Fs.List(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	wrappedEntries := make(fs.DirEntries, len(entries))
+	for i, entry := range entries {
+		if obj, ok := entry.(fs.Object); ok {
+			wrappedEntries[i] = f.wrapObject(obj)
+		} else {
+			wrappedEntries[i] = entry
+		}
+	}
+	return wrappedEntries, nil
+}
+
+func (f *failRemoveFs) Features() *fs.Features {
+	return f.features
+}
+
+func (f *failRemoveFs) UnWrap() fs.Fs {
+	return f.Fs
+}
+
+func (f *failRemoveFs) wrapObject(obj fs.Object) fs.Object {
+	if f.enabled && obj.Remote() == f.failRemote {
+		return &failRemoveObject{
+			Object: obj,
+			parent: f,
+		}
+	}
+	return obj
+}
+
+func (o *failRemoveObject) Remove(ctx context.Context) error {
+	o.parent.removeCalls = append(o.parent.removeCalls, o.Remote())
+	return o.parent.failErr
+}
+
+func (o *failRemoveObject) UnWrap() fs.Object {
+	return o.Object
+}
+
 func deriveFs(ctx context.Context, t *testing.T, f fs.Fs, path string, opts settings) fs.Fs {
 	fsName := strings.Split(f.Name(), "{")[0] // strip off hash
 	configMap := configmap.Simple{}
@@ -1324,6 +1399,86 @@ func testRenameBaseMoveFailureCurrentBehavior(t *testing.T, f *Fs) {
 	assert.NotEqual(t, oldContents, fstests.ReadObject(ctx, t, postObject, -1))
 }
 
+func testRemoveOldChunksFailureCurrentBehavior(t *testing.T, f *Fs) {
+	ctx := context.Background()
+	const (
+		dir      = "removeoldchunksfail"
+		filename = "file"
+	)
+
+	fsResult := deriveFs(ctx, t, f, dir, settings{
+		"chunk_size":   "10",
+		"name_format":  "*.#",
+		"hash_type":    "none",
+		"transactions": "norename",
+		"meta_format":  "simplejson",
+	})
+	chunkFs, ok := fsResult.(*Fs)
+	require.True(t, ok, "fs must be a chunker remote")
+	baseFs := chunkFs.base
+	_ = operations.Purge(ctx, baseFs, "")
+	defer func() {
+		_ = operations.Purge(ctx, baseFs, "")
+	}()
+
+	chunkSize := int(chunkFs.opt.ChunkSize)
+	oldContents := strings.Repeat("o", chunkSize*2+1)
+	oldObject := testPutFile(ctx, t, chunkFs, filename, oldContents, "upload old chunked file", true)
+	oldChunkerObject, ok := oldObject.(*Object)
+	require.True(t, ok)
+	require.NotNil(t, oldChunkerObject.main, "old object must have metadata")
+	require.Greater(t, len(oldChunkerObject.chunks), 1, "old object must be chunked")
+	require.NotEmpty(t, oldChunkerObject.xactID, "old object must use norename transaction chunks")
+
+	oldChunkRemotes := make([]string, 0, len(oldChunkerObject.chunks))
+	for _, chunk := range oldChunkerObject.chunks {
+		remote := chunk.Remote()
+		oldChunkRemotes = append(oldChunkRemotes, remote)
+		baseChunk, err := baseFs.NewObject(ctx, remote)
+		require.NoError(t, err, "old active chunk exists before replacement")
+		require.NotNil(t, baseChunk, "old active chunk exists before replacement")
+	}
+	failRemote := oldChunkRemotes[0]
+
+	sentinelErr := errors.New("old chunk remove failed")
+	failBase := newFailRemoveFs(baseFs, failRemote, sentinelErr)
+	chunkFs.base = failBase
+	chunkFs.features = chunkFs.features.WrapsFs(chunkFs, failBase)
+	failBase.enabled = true
+
+	replacementContents := strings.Repeat("n", chunkSize*3+1)
+	replacementInfo := object.NewStaticObjectInfo(filename, mtime1, int64(len(replacementContents)), true, nil, nil)
+	err := oldChunkerObject.Update(ctx, bytes.NewBufferString(replacementContents), replacementInfo)
+	require.NoError(t, err, "removeOldChunks must not fail the successful replacement")
+	assert.Contains(t, failBase.removeCalls, failRemote)
+
+	currentObject, err := chunkFs.NewObject(ctx, filename)
+	require.NoError(t, err)
+	assert.Equal(t, replacementContents, fstests.ReadObject(ctx, t, currentObject, -1))
+
+	currentChunkerObject, ok := currentObject.(*Object)
+	require.True(t, ok)
+	require.NotEmpty(t, currentChunkerObject.xactID, "replacement object must use norename transaction chunks")
+	currentChunkRemotes := make([]string, 0, len(currentChunkerObject.chunks))
+	for _, chunk := range currentChunkerObject.chunks {
+		currentChunkRemotes = append(currentChunkRemotes, chunk.Remote())
+	}
+	assert.NotContains(t, currentChunkRemotes, failRemote, "stale old chunk must not be active in the replacement object")
+
+	entries, err := chunkFs.List(ctx, "")
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "normal listing must not expose the stale old chunk as an active object")
+	assert.Equal(t, filename, entries[0].Remote())
+
+	staleChunk, err := failBase.NewObject(ctx, failRemote)
+	require.NoError(t, err, "failed old chunk remove leaves a stale orphan in the base remote")
+	assert.Equal(t, oldContents[:chunkSize], fstests.ReadObject(ctx, t, staleChunk, -1))
+	for _, remote := range oldChunkRemotes[1:] {
+		_, err := failBase.NewObject(ctx, remote)
+		assert.ErrorIs(t, err, fs.ErrorObjectNotFound, "old chunk removed successfully when Remove did not fail")
+	}
+}
+
 // The newer method of doing transactions without renaming should still be able to correctly process chunks that were created with renaming
 // If you attempt to do the inverse, however, the data chunks will be ignored causing commands to perform incorrectly
 func testBackwardsCompatibility(t *testing.T, f *Fs) {
@@ -1581,6 +1736,9 @@ func (f *Fs) InternalTest(t *testing.T) {
 	})
 	t.Run("RenameBaseMoveFailureCurrentBehavior", func(t *testing.T) {
 		testRenameBaseMoveFailureCurrentBehavior(t, f)
+	})
+	t.Run("RemoveOldChunksFailureCurrentBehavior", func(t *testing.T) {
+		testRemoveOldChunksFailureCurrentBehavior(t, f)
 	})
 	t.Run("BackwardsCompatibility", func(t *testing.T) {
 		testBackwardsCompatibility(t, f)
