@@ -78,6 +78,68 @@ func (f *failPutFs) UnWrap() fs.Fs {
 	return f.Fs
 }
 
+type failMoveCopyFs struct {
+	fs.Fs
+	failRemote string
+	failErr    error
+	enabled    bool
+	features   *fs.Features
+	moves      []string
+	copies     []string
+	failedOp   string
+}
+
+func newFailMoveCopyFs(base fs.Fs, failRemote string, failErr error) *failMoveCopyFs {
+	f := &failMoveCopyFs{
+		Fs:         base,
+		failRemote: failRemote,
+		failErr:    failErr,
+	}
+	baseFeatures := base.Features()
+	f.features = baseFeatures.Wrap(f)
+	if baseFeatures.Move != nil {
+		f.features.Move = f.Move
+	}
+	if baseFeatures.Copy != nil {
+		f.features.Copy = f.Copy
+	}
+	return f
+}
+
+func (f *failMoveCopyFs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	f.moves = append(f.moves, remote)
+	if f.enabled && remote == f.failRemote {
+		f.failedOp = "move"
+		return nil, f.failErr
+	}
+	doMove := f.Fs.Features().Move
+	if doMove == nil {
+		return nil, fs.ErrorCantMove
+	}
+	return doMove(ctx, src, remote)
+}
+
+func (f *failMoveCopyFs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	f.copies = append(f.copies, remote)
+	if f.enabled && remote == f.failRemote {
+		f.failedOp = "copy"
+		return nil, f.failErr
+	}
+	doCopy := f.Fs.Features().Copy
+	if doCopy == nil {
+		return nil, fs.ErrorCantCopy
+	}
+	return doCopy(ctx, src, remote)
+}
+
+func (f *failMoveCopyFs) Features() *fs.Features {
+	return f.features
+}
+
+func (f *failMoveCopyFs) UnWrap() fs.Fs {
+	return f.Fs
+}
+
 func deriveFs(ctx context.Context, t *testing.T, f fs.Fs, path string, opts settings) fs.Fs {
 	fsName := strings.Split(f.Name(), "{")[0] // strip off hash
 	configMap := configmap.Simple{}
@@ -1176,6 +1238,92 @@ func testMetadataWriteFailurePreservesNonChunkedObject(t *testing.T, f *Fs) {
 	assert.Equal(t, oldContents, fstests.ReadObject(ctx, t, restoredObject, -1))
 }
 
+func testRenameBaseMoveFailureCurrentBehavior(t *testing.T, f *Fs) {
+	ctx := context.Background()
+	const (
+		dir      = "renamebasefail"
+		filename = "file"
+	)
+	_ = operations.Purge(ctx, f.base, dir)
+	defer func() {
+		_ = operations.Purge(ctx, f.base, dir)
+	}()
+
+	fsResult := deriveFs(ctx, t, f, dir, settings{
+		"chunk_size":   "10",
+		"name_format":  "*.#",
+		"hash_type":    "none",
+		"transactions": "rename",
+		"meta_format":  "simplejson",
+	})
+	chunkFs, ok := fsResult.(*Fs)
+	require.True(t, ok, "fs must be a chunker remote")
+
+	baseFeatures := chunkFs.base.Features()
+	if baseFeatures.Move == nil && baseFeatures.Copy == nil {
+		t.Skip("wrapped remote has neither Move nor Copy feature")
+	}
+	expectedOp := "copy"
+	if baseFeatures.Move != nil {
+		expectedOp = "move"
+	}
+
+	chunkSize := int(chunkFs.opt.ChunkSize)
+	oldContents := strings.Repeat("o", chunkSize*2+1)
+	oldObject := testPutFile(ctx, t, chunkFs, filename, oldContents, "upload old chunked file", true)
+	oldChunkerObject, ok := oldObject.(*Object)
+	require.True(t, ok)
+	require.NotNil(t, oldChunkerObject.main, "old object must have metadata")
+	require.Greater(t, len(oldChunkerObject.chunks), 1, "old object must be chunked")
+
+	oldMetadataRemote := oldChunkerObject.main.Remote()
+	oldMetadataObject, err := chunkFs.base.NewObject(ctx, oldMetadataRemote)
+	require.NoError(t, err, "old metadata exists before failed replacement")
+	oldMetadata, err := operations.ReadFile(ctx, oldMetadataObject)
+	require.NoError(t, err, "old metadata can be read before failed replacement")
+
+	oldChunkRemotes := make([]string, 0, len(oldChunkerObject.chunks))
+	for _, chunk := range oldChunkerObject.chunks {
+		remote := chunk.Remote()
+		oldChunkRemotes = append(oldChunkRemotes, remote)
+		baseChunk, err := chunkFs.base.NewObject(ctx, remote)
+		require.NoError(t, err, "old active chunk exists before failed replacement")
+		require.NotNil(t, baseChunk, "old active chunk exists before failed replacement")
+	}
+
+	sentinelErr := errors.New("final chunk rename failed")
+	failRemote := chunkFs.makeChunkName(filename, 0, "", "")
+	require.Contains(t, oldChunkRemotes, failRemote, "first permanent chunk remote must be an old active chunk")
+	failBase := newFailMoveCopyFs(chunkFs.base, failRemote, sentinelErr)
+	chunkFs.base = failBase
+	chunkFs.features = chunkFs.features.WrapsFs(chunkFs, failBase)
+
+	replacementContents := strings.Repeat("n", chunkSize*3+1)
+	replacementInfo := object.NewStaticObjectInfo(filename, mtime1, int64(len(replacementContents)), true, nil, nil)
+	failBase.enabled = true
+	err = oldChunkerObject.Update(ctx, bytes.NewBufferString(replacementContents), replacementInfo)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, sentinelErr) || strings.Contains(err.Error(), sentinelErr.Error()))
+	assert.Equal(t, expectedOp, failBase.failedOp)
+	assert.Contains(t, append(failBase.moves, failBase.copies...), failRemote)
+
+	for _, remote := range oldChunkRemotes {
+		_, err := chunkFs.base.NewObject(ctx, remote)
+		assert.ErrorIs(t, err, fs.ErrorObjectNotFound, "old active chunk must have been removed before final rename failure")
+	}
+
+	metadataObject, err := chunkFs.base.NewObject(ctx, oldMetadataRemote)
+	require.NoError(t, err, "old metadata remains after failed replacement")
+	metadataAfter, err := operations.ReadFile(ctx, metadataObject)
+	require.NoError(t, err, "old metadata can be read after failed replacement")
+	assert.Equal(t, oldMetadata, metadataAfter, "new metadata must not be committed after final rename failure")
+
+	postObject, err := chunkFs.NewObject(ctx, filename)
+	require.NoError(t, err, "current behavior exposes the remaining old metadata object")
+	assert.Equal(t, string(oldMetadata), fstests.ReadObject(ctx, t, postObject, -1))
+	assert.NotEqual(t, oldContents, fstests.ReadObject(ctx, t, postObject, -1))
+}
+
 // The newer method of doing transactions without renaming should still be able to correctly process chunks that were created with renaming
 // If you attempt to do the inverse, however, the data chunks will be ignored causing commands to perform incorrectly
 func testBackwardsCompatibility(t *testing.T, f *Fs) {
@@ -1430,6 +1578,9 @@ func (f *Fs) InternalTest(t *testing.T) {
 	})
 	t.Run("MetadataWriteFailurePreservesNonChunkedObject", func(t *testing.T) {
 		testMetadataWriteFailurePreservesNonChunkedObject(t, f)
+	})
+	t.Run("RenameBaseMoveFailureCurrentBehavior", func(t *testing.T) {
+		testRenameBaseMoveFailureCurrentBehavior(t, f)
 	})
 	t.Run("BackwardsCompatibility", func(t *testing.T) {
 		testBackwardsCompatibility(t, f)
