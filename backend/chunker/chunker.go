@@ -1257,9 +1257,22 @@ func (f *Fs) put(
 		xactID:    xactID,
 	}
 
+	obj, metaObject, err = f.finalizeUpload(ctx, st, basePut, func() {
+		c.updateHashes()
+		st.md5, st.sha1 = c.md5, c.sha1
+	})
+	return obj, err
+}
+
+func (f *Fs) finalizeUpload(
+	ctx context.Context,
+	st *chunkerUploadState,
+	basePut putFn,
+	updateHashes func(),
+) (fs.Object, fs.Object, error) {
 	// Validate uploaded size
 	if st.sizeTotal != -1 && st.readCount != st.sizeTotal {
-		return nil, fmt.Errorf("incorrect upload size %d != %d", st.readCount, st.sizeTotal)
+		return nil, nil, fmt.Errorf("incorrect upload size %d != %d", st.readCount, st.sizeTotal)
 	}
 
 	// Check for input that looks like valid metadata
@@ -1282,12 +1295,12 @@ func (f *Fs) put(
 			chunkMoved, errMove := f.baseMove(ctx, chunk, st.remote, delAlways)
 			if errMove != nil {
 				silentlyRemove(ctx, chunk)
-				return nil, errMove
+				return nil, nil, errMove
 			}
 			chunk = chunkMoved
 		}
 
-		return f.newObject("", chunk, nil), nil
+		return f.newObject("", chunk, nil), nil, nil
 	}
 
 	// Validate total size of data chunks
@@ -1296,7 +1309,7 @@ func (f *Fs) put(
 		sizeTotal += chunk.Size()
 	}
 	if sizeTotal != st.readCount {
-		return nil, fmt.Errorf("incorrect chunks size %d != %d", sizeTotal, st.readCount)
+		return nil, nil, fmt.Errorf("incorrect chunks size %d != %d", sizeTotal, st.readCount)
 	}
 
 	// If previous object was chunked, remove its chunks
@@ -1308,7 +1321,7 @@ func (f *Fs) put(
 			chunkRemote := f.makeChunkName(st.remote, chunkNo, "", "")
 			chunkMoved, errMove := f.baseMove(ctx, chunk, chunkRemote, delFailed)
 			if errMove != nil {
-				return nil, errMove
+				return nil, nil, errMove
 			}
 			st.chunks[chunkNo] = chunkMoved
 		}
@@ -1324,29 +1337,30 @@ func (f *Fs) put(
 
 		o := f.newObject(st.remote, nil, st.chunks)
 		o.size = sizeTotal
-		return o, nil
+		return o, nil, nil
 	}
 
 	// Update meta object
+	var err error
 	var metadata []byte
 	switch f.opt.MetaFormat {
 	case "simplejson":
-		c.updateHashes()
-		st.md5, st.sha1 = c.md5, c.sha1
+		updateHashes()
 		metadata, err = marshalSimpleJSON(ctx, sizeTotal, len(st.chunks), st.md5, st.sha1, st.xactID)
 	}
+	var metaObject fs.Object
 	if err == nil {
 		metaInfo := f.wrapInfo(st.src, st.remote, int64(len(metadata)))
 		metaObject, err = basePut(ctx, bytes.NewReader(metadata), metaInfo)
 	}
 	if err != nil {
-		return nil, err
+		return nil, metaObject, err
 	}
 
 	o := f.newObject("", metaObject, st.chunks)
 	o.size = sizeTotal
 	o.xactID = st.xactID
-	return o, nil
+	return o, metaObject, nil
 }
 
 type putFn func(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error)
