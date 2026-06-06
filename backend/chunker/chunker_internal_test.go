@@ -97,6 +97,20 @@ type chunkWriterTestObject struct {
 	parent *chunkWriterRetryPutFs
 }
 
+type multipartTrackingFs struct {
+	fs.Fs
+	mu       sync.Mutex
+	puts     []multipartTrackingPutCall
+	features *fs.Features
+}
+
+type multipartTrackingPutCall struct {
+	remote   string
+	content  string
+	size     int64
+	seekable bool
+}
+
 func newFailPutFs(base fs.Fs, failRemote string, failErr error) *failPutFs {
 	f := &failPutFs{
 		Fs:         base,
@@ -236,6 +250,39 @@ func (o *chunkWriterTestObject) Remove(ctx context.Context) error {
 	o.parent.removes = append(o.parent.removes, o.Remote())
 	delete(o.parent.objects, o.Remote())
 	return nil
+}
+
+func newMultipartTrackingFs(base fs.Fs) *multipartTrackingFs {
+	f := &multipartTrackingFs{
+		Fs: base,
+	}
+	f.features = base.Features().Wrap(f)
+	return f
+}
+
+func (f *multipartTrackingFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	buf, err := io.ReadAll(in)
+	if err != nil {
+		return nil, err
+	}
+	_, seekable := in.(io.Seeker)
+	f.mu.Lock()
+	f.puts = append(f.puts, multipartTrackingPutCall{
+		remote:   src.Remote(),
+		content:  string(buf),
+		size:     src.Size(),
+		seekable: seekable,
+	})
+	f.mu.Unlock()
+	return f.Fs.Put(ctx, bytes.NewReader(buf), src, options...)
+}
+
+func (f *multipartTrackingFs) Features() *fs.Features {
+	return f.features
+}
+
+func (f *multipartTrackingFs) UnWrap() fs.Fs {
+	return f.Fs
 }
 
 type failMoveCopyFs struct {
@@ -392,19 +439,7 @@ func newTestChunkerChunkWriter(t *testing.T, remote string, size int64) (*chunke
 	t.Helper()
 	ctx := context.Background()
 	base := &trackingPutFs{Fs: object.MemoryFs}
-	f := &Fs{
-		base: base,
-		name: "chunker",
-		opt: Options{
-			ChunkSize:    fs.SizeSuffix(4),
-			NameFormat:   "*.rclone_chunk.###",
-			StartFrom:    1,
-			MetaFormat:   "simplejson",
-			HashType:     "none",
-			Transactions: "rename",
-		},
-	}
-	require.NoError(t, f.configure(f.opt.NameFormat, f.opt.MetaFormat, f.opt.HashType, f.opt.Transactions))
+	f := newTestChunkerFsWithBase(t, ctx, base, "none")
 
 	src := object.NewStaticObjectInfo(remote, mtime1, size, true, nil, nil)
 	writer, err := f.newChunkerChunkWriter(ctx, remote, src)
@@ -412,9 +447,8 @@ func newTestChunkerChunkWriter(t *testing.T, remote string, size int64) (*chunke
 	return writer, base
 }
 
-func newTestChunkerChunkWriterWithBase(t *testing.T, base fs.Fs, remote string, size int64) *chunkerChunkWriter {
+func newTestChunkerFsWithBase(t *testing.T, ctx context.Context, base fs.Fs, hashType string) *Fs {
 	t.Helper()
-	ctx := context.Background()
 	f := &Fs{
 		base: base,
 		name: "chunker",
@@ -423,7 +457,7 @@ func newTestChunkerChunkWriterWithBase(t *testing.T, base fs.Fs, remote string, 
 			NameFormat:   "*.rclone_chunk.###",
 			StartFrom:    1,
 			MetaFormat:   "simplejson",
-			HashType:     "none",
+			HashType:     hashType,
 			Transactions: "rename",
 		},
 	}
@@ -444,6 +478,20 @@ func newTestChunkerChunkWriterWithBase(t *testing.T, base fs.Fs, remote string, 
 	}).Fill(ctx, f).Mask(ctx, base).WrapsFs(f, base)
 	f.features.ListR = nil
 	f.features.ListP = nil
+	if hashType == "none" {
+		f.features.OpenChunkWriter = f.OpenChunkWriter
+		f.features.PutStream = f.PutStream
+	} else {
+		f.features.OpenChunkWriter = nil
+	}
+	f.features.DisableList(fs.GetConfig(ctx).DisableFeatures)
+	return f
+}
+
+func newTestChunkerChunkWriterWithBase(t *testing.T, base fs.Fs, remote string, size int64) *chunkerChunkWriter {
+	t.Helper()
+	ctx := context.Background()
+	f := newTestChunkerFsWithBase(t, ctx, base, "none")
 
 	src := object.NewStaticObjectInfo(remote, mtime1, size, true, nil, nil)
 	writer, err := f.newChunkerChunkWriter(ctx, remote, src)
@@ -477,6 +525,11 @@ func newTestOpenChunkWriterFs(t *testing.T, hashType string) (*Fs, fs.Fs) {
 
 func newTestOpenChunkWriterFsWithContext(t *testing.T, ctx context.Context, hashType string) (*Fs, fs.Fs) {
 	t.Helper()
+	return newTestOpenChunkWriterFsWithOptions(t, ctx, hashType, "4B")
+}
+
+func newTestOpenChunkWriterFsWithOptions(t *testing.T, ctx context.Context, hashType, chunkSize string) (*Fs, fs.Fs) {
+	t.Helper()
 	base, err := fs.TemporaryLocalFs(ctx)
 	require.NoError(t, err)
 	require.NoError(t, base.Mkdir(ctx, ""))
@@ -486,7 +539,7 @@ func newTestOpenChunkWriterFsWithContext(t *testing.T, ctx context.Context, hash
 
 	configMap := configmap.Simple{
 		"remote":     fs.ConfigStringFull(base),
-		"chunk_size": "4B",
+		"chunk_size": chunkSize,
 		"hash_type":  hashType,
 	}
 	chunkerFs, err := fs.NewFs(ctx, fmt.Sprintf(":chunker,%s:", configMap.String()))
@@ -607,6 +660,222 @@ func TestChunkerOpenChunkWriterRejectsFutureMetadata(t *testing.T) {
 	_, writer, err := f.OpenChunkWriter(ctx, file, src)
 	assert.ErrorIs(t, err, ErrMetaUnknown)
 	assert.Nil(t, writer)
+}
+
+func TestChunkerHashNonePutUsesMultipartWriterPath(t *testing.T) {
+	ctx := context.Background()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+	trackingBase := newMultipartTrackingFs(base)
+	f := newTestChunkerFsWithBase(t, ctx, trackingBase, "none")
+
+	src := object.NewStaticObjectInfo("dir/file.txt", mtime1, 10, true, nil, nil)
+	obj, err := f.Put(ctx, strings.NewReader("abcdefghij"), src)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, "abcdefghij", fstests.ReadObject(ctx, t, obj, -1))
+
+	trackingBase.mu.Lock()
+	puts := append([]multipartTrackingPutCall(nil), trackingBase.puts...)
+	trackingBase.mu.Unlock()
+	require.Len(t, puts, 4)
+	for i, call := range puts[:3] {
+		assert.True(t, call.seekable, "data chunk %d should be uploaded from multipart buffer", i)
+		parentPath, chunkNo, ctrlType, xactID := f.parseChunkName(call.remote)
+		assert.Equal(t, src.Remote(), parentPath)
+		assert.Equal(t, i, chunkNo)
+		assert.Empty(t, ctrlType)
+		assert.NotEmpty(t, xactID)
+	}
+	assert.Equal(t, src.Remote(), puts[3].remote)
+}
+
+func TestChunkerHashNoneUpdateUsesMultipartWriterPath(t *testing.T) {
+	ctx := context.Background()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+	trackingBase := newMultipartTrackingFs(base)
+	f := newTestChunkerFsWithBase(t, ctx, trackingBase, "none")
+
+	oldSrc := object.NewStaticObjectInfo("dir/file.txt", mtime1, 3, true, nil, nil)
+	oldObj, err := f.Put(ctx, strings.NewReader("old"), oldSrc)
+	require.NoError(t, err)
+	obj, ok := oldObj.(*Object)
+	require.True(t, ok)
+	trackingBase.mu.Lock()
+	trackingBase.puts = nil
+	trackingBase.mu.Unlock()
+
+	updateSrc := object.NewStaticObjectInfo("source-name.txt", mtime1, 10, true, nil, nil)
+	require.NoError(t, obj.Update(ctx, strings.NewReader("abcdefghij"), updateSrc))
+	assert.Equal(t, "dir/file.txt", obj.Remote())
+	assert.Equal(t, "abcdefghij", fstests.ReadObject(ctx, t, obj, -1))
+
+	trackingBase.mu.Lock()
+	puts := append([]multipartTrackingPutCall(nil), trackingBase.puts...)
+	trackingBase.mu.Unlock()
+	require.Len(t, puts, 4)
+	for i, call := range puts[:3] {
+		assert.True(t, call.seekable, "data chunk %d should be uploaded from multipart buffer", i)
+		parentPath, chunkNo, ctrlType, xactID := f.parseChunkName(call.remote)
+		assert.Equal(t, "dir/file.txt", parentPath)
+		assert.Equal(t, i, chunkNo)
+		assert.Empty(t, ctrlType)
+		assert.NotEmpty(t, xactID)
+	}
+	assert.Equal(t, "dir/file.txt", puts[3].remote)
+}
+
+func TestChunkerHashNonePutStreamUnknownSizeUsesMultipartWriterPath(t *testing.T) {
+	ctx := context.Background()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+	trackingBase := newMultipartTrackingFs(base)
+	trackingBase.features.PutStream = nil
+	f := newTestChunkerFsWithBase(t, ctx, trackingBase, "none")
+	require.NotNil(t, f.Features().PutStream)
+
+	src := object.NewStaticObjectInfo("stream/file.txt", mtime1, -1, true, nil, nil)
+	obj, err := f.PutStream(ctx, strings.NewReader("abcdefghij"), src)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, int64(10), obj.Size())
+	assert.Equal(t, "abcdefghij", fstests.ReadObject(ctx, t, obj, -1))
+
+	trackingBase.mu.Lock()
+	puts := append([]multipartTrackingPutCall(nil), trackingBase.puts...)
+	trackingBase.mu.Unlock()
+	require.Len(t, puts, 4)
+	for i, call := range puts[:3] {
+		assert.True(t, call.seekable, "data chunk %d should be uploaded from multipart buffer", i)
+		parentPath, chunkNo, ctrlType, xactID := f.parseChunkName(call.remote)
+		assert.Equal(t, src.Remote(), parentPath)
+		assert.Equal(t, i, chunkNo)
+		assert.Empty(t, ctrlType)
+		assert.NotEmpty(t, xactID)
+	}
+	assert.Equal(t, int64(10), obj.Size())
+}
+
+func TestChunkerHashNonePutStreamZeroByteUsesMultipartWriterPath(t *testing.T) {
+	ctx := context.Background()
+	f, _ := newTestOpenChunkWriterFs(t, "none")
+	src := object.NewStaticObjectInfo("empty.txt", mtime1, -1, true, nil, nil)
+
+	obj, err := f.PutStream(ctx, strings.NewReader(""), src)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, int64(0), obj.Size())
+	assert.Equal(t, "", fstests.ReadObject(ctx, t, obj, -1))
+
+	baseObj, err := f.base.NewObject(ctx, "empty.txt")
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), baseObj.Size())
+}
+
+func TestChunkerHashModePutKeepsOldPath(t *testing.T) {
+	ctx := context.Background()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+	trackingBase := newMultipartTrackingFs(base)
+	f := newTestChunkerFsWithBase(t, ctx, trackingBase, "md5")
+
+	src := object.NewStaticObjectInfo("dir/file.txt", mtime1, 10, true, nil, nil)
+	obj, err := f.Put(ctx, strings.NewReader("abcdefghij"), src)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, "abcdefghij", fstests.ReadObject(ctx, t, obj, -1))
+
+	trackingBase.mu.Lock()
+	puts := append([]multipartTrackingPutCall(nil), trackingBase.puts...)
+	trackingBase.mu.Unlock()
+	require.Len(t, puts, 4)
+	assert.False(t, puts[0].seekable, "md5 Put should keep old streaming chunkingReader path")
+	parentPath, chunkNo, ctrlType, xactID := f.parseChunkName(puts[0].remote)
+	assert.Equal(t, src.Remote(), parentPath)
+	assert.Equal(t, 0, chunkNo)
+	assert.Empty(t, ctrlType)
+	assert.NotEmpty(t, xactID)
+}
+
+func TestChunkerHashNonePutChunkRemoteKeepsSoftFailHardBehavior(t *testing.T) {
+	ctx := context.Background()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+	trackingBase := newMultipartTrackingFs(base)
+	f := newTestChunkerFsWithBase(t, ctx, trackingBase, "none")
+
+	chunkRemote := f.makeChunkName("parent.txt", 0, "", "")
+	src := object.NewStaticObjectInfo(chunkRemote, mtime1, 4, true, nil, nil)
+	obj, err := f.Put(ctx, strings.NewReader("data"), src)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, "data", fstests.ReadObject(ctx, t, obj, -1))
+
+	trackingBase.mu.Lock()
+	puts := append([]multipartTrackingPutCall(nil), trackingBase.puts...)
+	trackingBase.mu.Unlock()
+	require.Len(t, puts, 1)
+	assert.True(t, puts[0].seekable)
+
+	trackingBase.mu.Lock()
+	trackingBase.puts = nil
+	trackingBase.mu.Unlock()
+	f.opt.FailHard = true
+
+	strictChunkRemote := f.makeChunkName("strict-parent.txt", 0, "", "")
+	strictSrc := object.NewStaticObjectInfo(strictChunkRemote, mtime1, 4, true, nil, nil)
+	obj, err = f.Put(ctx, strings.NewReader("data"), strictSrc)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "chunk overlap")
+	assert.Nil(t, obj)
+
+	trackingBase.mu.Lock()
+	puts = append([]multipartTrackingPutCall(nil), trackingBase.puts...)
+	trackingBase.mu.Unlock()
+	assert.Empty(t, puts)
+}
+
+func TestChunkerHashNoneUploadMultipartFinalizerFailureAborts(t *testing.T) {
+	ctx := context.Background()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+	sentinelErr := errors.New("metadata write failed")
+	failBase := newFailPutFs(base, "file.txt", sentinelErr)
+	f := newTestChunkerFsWithBase(t, ctx, failBase, "none")
+
+	src := object.NewStaticObjectInfo("file.txt", mtime1, 8, true, nil, nil)
+	failBase.enabled = true
+	obj, err := f.Put(ctx, strings.NewReader("abcdefgh"), src)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, sentinelErr)
+	assert.Nil(t, obj)
+
+	for i := range 2 {
+		tempRemote := f.makeChunkName(src.Remote(), i, "", "")
+		_, err := base.NewObject(ctx, tempRemote)
+		assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+	}
+	_, err = base.NewObject(ctx, src.Remote())
+	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
 }
 
 func TestChunkerChunkWriterWriteChunkTempChunkName(t *testing.T) {
@@ -2041,7 +2310,8 @@ func testMetadataWriteFailurePreservesNonChunkedObject(t *testing.T, f *Fs) {
 	}()
 
 	fsResult := deriveFs(ctx, t, f, dir, settings{
-		"chunk_size":   "1P",
+		// This only needs to be larger than the test contents to keep the old object non-chunked.
+		"chunk_size":   "1Ki",
 		"name_format":  "*.#",
 		"hash_type":    "none",
 		"transactions": "rename",

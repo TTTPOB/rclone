@@ -31,6 +31,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/pacer"
 )
 
@@ -362,6 +363,7 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 	f.features.ListP = nil // ListP not supported yet
 	if opt.HashType == "none" {
 		f.features.OpenChunkWriter = f.OpenChunkWriter
+		f.features.PutStream = f.PutStream
 	} else {
 		f.features.OpenChunkWriter = nil
 	}
@@ -1149,12 +1151,7 @@ func (o *Object) readXactID(ctx context.Context) (xactID string, err error) {
 	return xactID, nil
 }
 
-// put implements Put, PutStream, PutUnchecked, Update
-func (f *Fs) put(
-	ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options []fs.OpenOption,
-	basePut putFn, action string, target fs.Object,
-) (obj fs.Object, err error) {
-	// Perform consistency checks
+func (f *Fs) checkUploadTarget(ctx context.Context, src fs.ObjectInfo, remote, action string, target fs.Object) (fs.Object, error) {
 	if err := f.forbidChunk(src, remote); err != nil {
 		return nil, fmt.Errorf("%s refused: %w", action, err)
 	}
@@ -1172,6 +1169,19 @@ func (f *Fs) put(
 			// refuse to update a file of unsupported format
 			return nil, fmt.Errorf("refusing to %s: %w", action, err)
 		}
+	}
+	return target, nil
+}
+
+// put implements Put, PutStream, PutUnchecked, Update
+func (f *Fs) put(
+	ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options []fs.OpenOption,
+	basePut putFn, action string, target fs.Object,
+) (obj fs.Object, err error) {
+	// Perform consistency checks
+	target, err = f.checkUploadTarget(ctx, src, remote, action, target)
+	if err != nil {
+		return nil, err
 	}
 
 	// Prepare to upload
@@ -1268,6 +1278,26 @@ func (f *Fs) put(
 		st.md5, st.sha1 = c.md5, c.sha1
 	})
 	return obj, err
+}
+
+// putMultipart implements the writer-centered hash_type=none upload path.
+func (f *Fs) putMultipart(ctx context.Context, in io.Reader, src fs.ObjectInfo, remote string, options []fs.OpenOption, action string, target fs.Object) (fs.Object, error) {
+	if f.opt.HashType != "none" {
+		return nil, fmt.Errorf("multipart %s requires hash_type none: %w", action, fs.ErrorNotImplemented)
+	}
+	if _, err := f.checkUploadTarget(ctx, src, remote, action, target); err != nil {
+		return nil, err
+	}
+
+	src = f.wrapInfo(src, remote, src.Size())
+	_, err := multipart.UploadMultipart(ctx, src, in, multipart.UploadMultipartOptions{
+		Open:        chunkerMultipartUpload{f: f},
+		OpenOptions: options,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return f.NewObject(ctx, remote)
 }
 
 func (f *Fs) finalizeUpload(
@@ -1369,6 +1399,25 @@ func (f *Fs) finalizeUpload(
 }
 
 type putFn func(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error)
+
+type chunkerMultipartUpload struct {
+	f *Fs
+}
+
+func (u chunkerMultipartUpload) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
+	var info fs.ChunkWriterInfo
+	chunkWriter, err := u.f.newChunkerChunkWriter(ctx, remote, src, options...)
+	if err != nil {
+		return info, nil, err
+	}
+	info = fs.ChunkWriterInfo{
+		ChunkSize:   int64(u.f.opt.ChunkSize),
+		Concurrency: 1,
+		// Chunker writer v1 relies on same-session rollback and removes temporary chunks on error rather than leaving parts for durable resume.
+		LeavePartsOnError: false,
+	}
+	return info, chunkWriter, nil
+}
 
 // chunkerChunkWriter is hidden scaffolding for a future OpenChunkWriter path.
 type chunkerChunkWriter struct {
@@ -1941,16 +1990,29 @@ func (f *Fs) removeOldChunks(ctx context.Context, remote string) {
 // will return the object and the error, otherwise will return
 // nil and the error
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	if f.opt.HashType == "none" {
+		return f.putMultipart(ctx, in, src, src.Remote(), options, "put", nil)
+	}
 	return f.put(ctx, in, src, src.Remote(), options, f.base.Put, "put", nil)
 }
 
 // PutStream uploads to the remote path with the modTime given of indeterminate size
 func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	if f.opt.HashType == "none" {
+		return f.putMultipart(ctx, in, src, src.Remote(), options, "upload", nil)
+	}
 	return f.put(ctx, in, src, src.Remote(), options, f.base.Features().PutStream, "upload", nil)
 }
 
 // Update in to the object with the modTime given of the given size
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	if o.f.opt.HashType == "none" {
+		oNew, err := o.f.putMultipart(ctx, in, src, o.Remote(), options, "update", o)
+		if err == nil {
+			*o = *oNew.(*Object)
+		}
+		return err
+	}
 	basePut := o.f.base.Put
 	if src.Size() < 0 {
 		basePut = o.f.base.Features().PutStream
