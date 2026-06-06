@@ -1362,6 +1362,50 @@ func (f *Fs) finalizeUpload(
 
 type putFn func(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error)
 
+// chunkerChunkWriter is hidden scaffolding for a future OpenChunkWriter path.
+type chunkerChunkWriter struct {
+	ctx         context.Context
+	f           *Fs
+	st          *chunkerUploadState
+	basePut     putFn
+	options     []fs.OpenOption
+	chunkSize   int64
+	sizeKnown   bool
+	sizeWritten int64
+	written     map[int]fs.Object
+	closed      bool
+	aborted     bool
+}
+
+func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (*chunkerChunkWriter, error) {
+	sizeTotal := src.Size()
+	sizeKnown := sizeTotal >= 0
+	if !sizeKnown {
+		sizeTotal = -1
+	}
+
+	xactID, err := f.newXactID(ctx, remote)
+	if err != nil {
+		return nil, err
+	}
+
+	return &chunkerChunkWriter{
+		ctx: ctx,
+		f:   f,
+		st: &chunkerUploadState{
+			src:       src,
+			remote:    remote,
+			sizeTotal: sizeTotal,
+			xactID:    xactID,
+		},
+		basePut:   f.base.Put,
+		options:   append([]fs.OpenOption(nil), options...),
+		chunkSize: int64(f.opt.ChunkSize),
+		sizeKnown: sizeKnown,
+		written:   make(map[int]fs.Object),
+	}, nil
+}
+
 type chunkerUploadState struct {
 	src        fs.ObjectInfo
 	remote     string
