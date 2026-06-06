@@ -1377,6 +1377,8 @@ type chunkerChunkWriter struct {
 	aborted     bool
 }
 
+var _ fs.ChunkWriter = (*chunkerChunkWriter)(nil)
+
 func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (*chunkerChunkWriter, error) {
 	sizeTotal := src.Size()
 	sizeKnown := sizeTotal >= 0
@@ -1458,6 +1460,70 @@ func (w *chunkerChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 	}
 
 	return chunkSize, nil
+}
+
+// Close finalizes a hidden chunk writer upload.
+func (w *chunkerChunkWriter) Close(ctx context.Context) error {
+	switch {
+	case w.closed:
+		return errors.New("chunk writer is closed")
+	case w.aborted:
+		return errors.New("chunk writer is aborted")
+	}
+
+	if len(w.st.chunks) == 0 {
+		return errors.New("missing chunk 0")
+	}
+
+	var sizeTotal int64
+	for chunkNumber, chunk := range w.st.chunks {
+		if chunk == nil {
+			return fmt.Errorf("missing chunk %d", chunkNumber+w.f.opt.StartFrom)
+		}
+		sizeTotal += chunk.Size()
+	}
+	if sizeTotal != w.st.readCount {
+		return fmt.Errorf("incorrect chunks size %d != %d", sizeTotal, w.st.readCount)
+	}
+	if w.sizeKnown && sizeTotal != w.st.sizeTotal {
+		return fmt.Errorf("incorrect upload size %d != %d", sizeTotal, w.st.sizeTotal)
+	}
+	if w.sizeKnown && w.sizeWritten != w.st.sizeTotal {
+		return fmt.Errorf("incorrect written size %d != %d", w.sizeWritten, w.st.sizeTotal)
+	}
+
+	if len(w.st.chunks) == 1 && w.st.readCount <= maxMetadataSize {
+		reader, err := w.st.chunks[0].Open(ctx)
+		if err != nil {
+			return err
+		}
+		head, err := io.ReadAll(io.LimitReader(reader, maxMetadataSize+1))
+		_ = reader.Close()
+		if err != nil {
+			return err
+		}
+		w.st.smallHead = head
+	}
+
+	_, err := w.f.finalizeUpload(ctx, w.st, w.basePut, func() {})
+	if err != nil {
+		return err
+	}
+	w.closed = true
+	return nil
+}
+
+// Abort rolls back chunks uploaded by a hidden chunk writer.
+func (w *chunkerChunkWriter) Abort(ctx context.Context) error {
+	if w.aborted {
+		return nil
+	}
+	if w.closed {
+		return errors.New("chunk writer is closed")
+	}
+	w.st.rollback(ctx)
+	w.aborted = true
+	return nil
 }
 
 type chunkerUploadState struct {
@@ -1624,6 +1690,9 @@ func (st *chunkerUploadState) rollback(ctx context.Context) {
 		st.chunks = append(st.chunks, st.metaObject)
 	}
 	for _, chunk := range st.chunks {
+		if chunk == nil {
+			continue
+		}
 		if err := chunk.Remove(ctx); err != nil {
 			fs.Errorf(chunk, "Failed to remove temporary chunk: %v", err)
 		}
