@@ -53,6 +53,17 @@ type failPutFs struct {
 	features   *fs.Features
 }
 
+type trackingPutFs struct {
+	fs.Fs
+	puts []trackingPutCall
+}
+
+type trackingPutCall struct {
+	remote  string
+	content string
+	size    int64
+}
+
 func newFailPutFs(base fs.Fs, failRemote string, failErr error) *failPutFs {
 	f := &failPutFs{
 		Fs:         base,
@@ -76,6 +87,19 @@ func (f *failPutFs) Features() *fs.Features {
 
 func (f *failPutFs) UnWrap() fs.Fs {
 	return f.Fs
+}
+
+func (f *trackingPutFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	buf, err := io.ReadAll(in)
+	if err != nil {
+		return nil, err
+	}
+	f.puts = append(f.puts, trackingPutCall{
+		remote:  src.Remote(),
+		content: string(buf),
+		size:    src.Size(),
+	})
+	return object.NewMemoryObject(src.Remote(), src.ModTime(ctx), buf).SetFs(f), nil
 }
 
 type failMoveCopyFs struct {
@@ -228,6 +252,30 @@ func deriveFs(ctx context.Context, t *testing.T, f fs.Fs, path string, opts sett
 	return fixFs
 }
 
+func newTestChunkerChunkWriter(t *testing.T, remote string, size int64) (*chunkerChunkWriter, *trackingPutFs) {
+	t.Helper()
+	ctx := context.Background()
+	base := &trackingPutFs{Fs: object.MemoryFs}
+	f := &Fs{
+		base: base,
+		name: "chunker",
+		opt: Options{
+			ChunkSize:    fs.SizeSuffix(4),
+			NameFormat:   "*.rclone_chunk.###",
+			StartFrom:    1,
+			MetaFormat:   "simplejson",
+			HashType:     "none",
+			Transactions: "rename",
+		},
+	}
+	require.NoError(t, f.configure(f.opt.NameFormat, f.opt.MetaFormat, f.opt.HashType, f.opt.Transactions))
+
+	src := object.NewStaticObjectInfo(remote, mtime1, size, true, nil, nil)
+	writer, err := f.newChunkerChunkWriter(ctx, remote, src)
+	require.NoError(t, err)
+	return writer, base
+}
+
 var mtime1 = fstest.Time("2001-02-03T04:05:06.499999999Z")
 
 func testPutFile(ctx context.Context, t *testing.T, f fs.Fs, name, contents, message string, check bool) fs.Object {
@@ -235,6 +283,67 @@ func testPutFile(ctx context.Context, t *testing.T, f fs.Fs, name, contents, mes
 	obj := fstests.PutTestContents(ctx, t, f, &item, contents, check)
 	assert.NotNil(t, obj, message)
 	return obj
+}
+
+func TestChunkerChunkWriterWriteChunkTempChunkName(t *testing.T) {
+	ctx := context.Background()
+	writer, base := newTestChunkerChunkWriter(t, "dir/file.txt", 12)
+
+	n, err := writer.WriteChunk(ctx, 2, strings.NewReader("data"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), n)
+
+	require.Len(t, base.puts, 1)
+	wantRemote := writer.f.makeChunkName("dir/file.txt", 2, "", writer.st.xactID)
+	assert.Equal(t, wantRemote, base.puts[0].remote)
+	assert.Equal(t, "data", base.puts[0].content)
+	assert.Equal(t, int64(4), base.puts[0].size)
+
+	require.Len(t, writer.st.chunks, 3)
+	assert.Nil(t, writer.st.chunks[0])
+	assert.Nil(t, writer.st.chunks[1])
+	require.NotNil(t, writer.st.chunks[2])
+	assert.Equal(t, wantRemote, writer.st.chunks[2].Remote())
+	assert.Equal(t, writer.st.chunks[2], writer.written[2])
+	assert.Equal(t, int64(4), writer.st.readCount)
+	assert.Equal(t, int64(4), writer.sizeWritten)
+}
+
+func TestChunkerChunkWriterWriteChunkRejectsDuplicate(t *testing.T) {
+	ctx := context.Background()
+	writer, base := newTestChunkerChunkWriter(t, "file.txt", 8)
+
+	n, err := writer.WriteChunk(ctx, 0, strings.NewReader("first"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), n)
+
+	n, err = writer.WriteChunk(ctx, 0, strings.NewReader("second"))
+	require.Error(t, err)
+	assert.Equal(t, int64(0), n)
+	assert.Contains(t, err.Error(), "duplicate chunk number")
+
+	require.Len(t, base.puts, 1)
+	assert.Equal(t, "first", base.puts[0].content)
+	assert.Equal(t, int64(5), writer.st.readCount)
+	assert.Equal(t, int64(5), writer.sizeWritten)
+}
+
+func TestChunkerChunkWriterWriteChunkRejectsInvalidChunkNumber(t *testing.T) {
+	ctx := context.Background()
+
+	for _, chunkNumber := range []int{-1, maxSafeChunkNumber + 1} {
+		t.Run(fmt.Sprint(chunkNumber), func(t *testing.T) {
+			writer, base := newTestChunkerChunkWriter(t, "file.txt", 4)
+
+			n, err := writer.WriteChunk(ctx, chunkNumber, strings.NewReader("data"))
+			require.Error(t, err)
+			assert.Equal(t, int64(0), n)
+			assert.Empty(t, base.puts)
+			assert.Empty(t, writer.written)
+			assert.Empty(t, writer.st.chunks)
+			assert.Equal(t, int64(0), writer.st.readCount)
+		})
+	}
 }
 
 // test chunk name parser

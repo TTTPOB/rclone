@@ -1406,6 +1406,60 @@ func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.Ob
 	}, nil
 }
 
+// WriteChunk writes one temporary hidden data chunk.
+func (w *chunkerChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
+	switch {
+	case w.closed:
+		return 0, errors.New("chunk writer is closed")
+	case w.aborted:
+		return 0, errors.New("chunk writer is aborted")
+	case chunkNumber < 0:
+		return 0, fmt.Errorf("invalid chunk number %d", chunkNumber)
+	case chunkNumber > maxSafeChunkNumber:
+		return 0, ErrChunkOverflow
+	}
+
+	if _, ok := w.written[chunkNumber]; ok {
+		return 0, fmt.Errorf("duplicate chunk number %d", chunkNumber+w.f.opt.StartFrom)
+	}
+	if chunkNumber < len(w.st.chunks) && w.st.chunks[chunkNumber] != nil {
+		return 0, fmt.Errorf("duplicate chunk number %d", chunkNumber+w.f.opt.StartFrom)
+	}
+
+	chunkSize, err := reader.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, fmt.Errorf("failed to seek chunk: %w", err)
+	}
+	if _, err = reader.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("failed to seek chunk: %w", err)
+	}
+
+	chunkRemote := w.f.makeChunkName(w.st.remote, chunkNumber, "", w.st.xactID)
+	chunkInfo := w.f.wrapInfo(w.st.src, chunkRemote, chunkSize)
+	chunk, err := w.basePut(ctx, reader, chunkInfo, w.options...)
+	if err != nil {
+		return 0, err
+	}
+
+	if chunkNumber == len(w.st.chunks) {
+		w.st.chunks = append(w.st.chunks, chunk)
+	} else {
+		if chunkNumber > len(w.st.chunks) {
+			chunks := make([]fs.Object, chunkNumber+1)
+			copy(chunks, w.st.chunks)
+			w.st.chunks = chunks
+		}
+		w.st.chunks[chunkNumber] = chunk
+	}
+	w.written[chunkNumber] = chunk
+	w.st.readCount += chunkSize
+	if w.sizeKnown {
+		w.sizeWritten += chunkSize
+	}
+
+	return chunkSize, nil
+}
+
 type chunkerUploadState struct {
 	src        fs.ObjectInfo
 	remote     string
