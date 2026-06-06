@@ -3,6 +3,7 @@ package chunker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/fstests"
 	"github.com/rclone/rclone/lib/random"
+	"github.com/rclone/rclone/lib/readers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1029,6 +1031,73 @@ func testFutureProof(t *testing.T, f *Fs) {
 	}())
 }
 
+func testReplacementFailureOrdering(t *testing.T, f *Fs) {
+	const dir = "replacefail"
+	ctx := context.Background()
+	saveOpt := f.opt
+	defer func() {
+		f.opt.FailHard = false
+		_ = operations.Purge(ctx, f.base, dir)
+		f.opt = saveOpt
+	}()
+	_ = operations.Purge(ctx, f.base, dir)
+	f.opt.FailHard = false
+	f.opt.ChunkSize = fs.SizeSuffix(10)
+
+	const filename = dir + "/file"
+	chunkSize := int(f.opt.ChunkSize)
+	oldContents := strings.Repeat("o", chunkSize*2+1)
+	oldObject := testPutFile(ctx, t, f, filename, oldContents, "upload old chunked file", true)
+	oldChunkerObject, ok := oldObject.(*Object)
+	require.True(t, ok)
+	require.Greater(t, len(oldChunkerObject.chunks), 1)
+
+	var oldMetadataRemote string
+	if oldChunkerObject.main != nil {
+		oldMetadataRemote = oldChunkerObject.main.Remote()
+		metaObj, err := f.base.NewObject(ctx, oldMetadataRemote)
+		require.NoError(t, err, "old metadata exists before failed replacement")
+		require.NotNil(t, metaObj, "old metadata exists before failed replacement")
+	}
+
+	oldChunkRemotes := make([]string, 0, len(oldChunkerObject.chunks))
+	for _, chunk := range oldChunkerObject.chunks {
+		remote := chunk.Remote()
+		oldChunkRemotes = append(oldChunkRemotes, remote)
+		baseChunk, err := f.base.NewObject(ctx, remote)
+		require.NoError(t, err, "old active chunk exists before failed replacement")
+		require.NotNil(t, baseChunk, "old active chunk exists before failed replacement")
+	}
+
+	sentinelErr := errors.New("replacement upload failed in second chunk")
+	replacementPrefix := strings.Repeat("n", chunkSize)
+	replacementReader := io.MultiReader(
+		bytes.NewBufferString(replacementPrefix),
+		readers.ErrorReader{Err: sentinelErr},
+	)
+	replacementInfo := object.NewStaticObjectInfo(filename, mtime1, int64(chunkSize+1), true, nil, nil)
+
+	err := oldChunkerObject.Update(ctx, replacementReader, replacementInfo)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, sentinelErr) || strings.Contains(err.Error(), sentinelErr.Error()))
+
+	restoredObject, err := f.NewObject(ctx, filename)
+	require.NoError(t, err)
+	require.NotNil(t, restoredObject)
+	assert.Equal(t, oldContents, fstests.ReadObject(ctx, t, restoredObject, -1))
+
+	if oldMetadataRemote != "" {
+		metaObj, err := f.base.NewObject(ctx, oldMetadataRemote)
+		require.NoError(t, err, "old metadata exists after failed replacement")
+		require.NotNil(t, metaObj, "old metadata exists after failed replacement")
+	}
+	for _, remote := range oldChunkRemotes {
+		baseChunk, err := f.base.NewObject(ctx, remote)
+		require.NoError(t, err, "old active chunk exists after failed replacement")
+		require.NotNil(t, baseChunk, "old active chunk exists after failed replacement")
+	}
+}
+
 // The newer method of doing transactions without renaming should still be able to correctly process chunks that were created with renaming
 // If you attempt to do the inverse, however, the data chunks will be ignored causing commands to perform incorrectly
 func testBackwardsCompatibility(t *testing.T, f *Fs) {
@@ -1277,6 +1346,9 @@ func (f *Fs) InternalTest(t *testing.T) {
 	})
 	t.Run("FutureProof", func(t *testing.T) {
 		testFutureProof(t, f)
+	})
+	t.Run("ReplacementFailureOrdering", func(t *testing.T) {
+		testReplacementFailureOrdering(t, f)
 	})
 	t.Run("BackwardsCompatibility", func(t *testing.T) {
 		testBackwardsCompatibility(t, f)
