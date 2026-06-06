@@ -11,7 +11,9 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -56,7 +58,17 @@ type failPutFs struct {
 
 type trackingPutFs struct {
 	fs.Fs
+	mu   sync.Mutex
 	puts []trackingPutCall
+}
+
+type blockingPutFs struct {
+	fs.Fs
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	puts    []trackingPutCall
 }
 
 type trackingPutCall struct {
@@ -115,6 +127,40 @@ func (f *trackingPutFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo
 	if err != nil {
 		return nil, err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.puts = append(f.puts, trackingPutCall{
+		remote:  src.Remote(),
+		content: string(buf),
+		size:    src.Size(),
+	})
+	return object.NewMemoryObject(src.Remote(), src.ModTime(ctx), buf).SetFs(f), nil
+}
+
+func newBlockingPutFs() *blockingPutFs {
+	return &blockingPutFs{
+		Fs:      object.MemoryFs,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (f *blockingPutFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	f.once.Do(func() {
+		close(f.started)
+	})
+	select {
+	case <-f.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	buf, err := io.ReadAll(in)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.puts = append(f.puts, trackingPutCall{
 		remote:  src.Remote(),
 		content: string(buf),
@@ -424,11 +470,143 @@ func newTestLocalChunkerChunkWriter(t *testing.T, remote string, size int64) (*c
 
 var mtime1 = fstest.Time("2001-02-03T04:05:06.499999999Z")
 
+func newTestOpenChunkWriterFs(t *testing.T, hashType string) (*Fs, fs.Fs) {
+	t.Helper()
+	return newTestOpenChunkWriterFsWithContext(t, context.Background(), hashType)
+}
+
+func newTestOpenChunkWriterFsWithContext(t *testing.T, ctx context.Context, hashType string) (*Fs, fs.Fs) {
+	t.Helper()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	require.NoError(t, base.Mkdir(ctx, ""))
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+
+	configMap := configmap.Simple{
+		"remote":     fs.ConfigStringFull(base),
+		"chunk_size": "4B",
+		"hash_type":  hashType,
+	}
+	chunkerFs, err := fs.NewFs(ctx, fmt.Sprintf(":chunker,%s:", configMap.String()))
+	require.NoError(t, err)
+	f, ok := chunkerFs.(*Fs)
+	require.True(t, ok)
+	return f, base
+}
+
 func testPutFile(ctx context.Context, t *testing.T, f fs.Fs, name, contents, message string, check bool) fs.Object {
 	item := fstest.Item{Path: name, ModTime: mtime1}
 	obj := fstests.PutTestContents(ctx, t, f, &item, contents, check)
 	assert.NotNil(t, obj, message)
 	return obj
+}
+
+func TestChunkerOpenChunkWriterAdvertisedForHashNone(t *testing.T) {
+	f, _ := newTestOpenChunkWriterFs(t, "none")
+	require.NotNil(t, f.Features().OpenChunkWriter)
+}
+
+func TestChunkerOpenChunkWriterRespectsDisableFeatures(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.DisableFeatures = []string{"OpenChunkWriter"}
+
+	f, _ := newTestOpenChunkWriterFsWithContext(t, ctx, "none")
+	assert.Nil(t, f.Features().OpenChunkWriter)
+}
+
+func TestChunkerOpenChunkWriterNotAdvertisedForHashModes(t *testing.T) {
+	for _, hashType := range []string{"md5", "md5quick"} {
+		t.Run(hashType, func(t *testing.T) {
+			f, _ := newTestOpenChunkWriterFs(t, hashType)
+			assert.Nil(t, f.Features().OpenChunkWriter)
+			assert.False(t, f.Features().ChunkWriterDoesntSeek)
+
+			src := object.NewStaticObjectInfo("file.txt", mtime1, 4, true, nil, nil)
+			_, writer, err := f.OpenChunkWriter(context.Background(), src.Remote(), src)
+			assert.ErrorIs(t, err, fs.ErrorNotImplemented)
+			assert.Nil(t, writer)
+		})
+	}
+}
+
+func TestChunkerOpenChunkWriterDirectSuccess(t *testing.T) {
+	f, _ := newTestOpenChunkWriterFs(t, "none")
+	src := object.NewStaticObjectInfo("dir/file.txt", mtime1, 8, true, nil, nil)
+
+	info, writer, err := f.OpenChunkWriter(context.Background(), src.Remote(), src)
+	require.NoError(t, err)
+	require.NotNil(t, writer)
+	assert.Equal(t, int64(4), info.ChunkSize)
+	assert.Equal(t, 1, info.Concurrency)
+	assert.False(t, info.LeavePartsOnError)
+	_, ok := writer.(*chunkerChunkWriter)
+	assert.True(t, ok)
+}
+
+func TestChunkerOpenChunkWriterDirectWritesOutOfOrder(t *testing.T) {
+	ctx := context.Background()
+	f, _ := newTestOpenChunkWriterFs(t, "none")
+	src := object.NewStaticObjectInfo("dir/file.txt", mtime1, 10, true, nil, nil)
+
+	info, writer, err := f.OpenChunkWriter(ctx, src.Remote(), src, &fs.ChunkOption{ChunkSize: 2})
+	require.NoError(t, err)
+	require.NotNil(t, writer)
+	assert.Equal(t, int64(4), info.ChunkSize)
+	assert.Equal(t, 1, info.Concurrency)
+	assert.False(t, info.LeavePartsOnError)
+
+	n, err := writer.WriteChunk(ctx, 1, strings.NewReader("efgh"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), n)
+	n, err = writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), n)
+	n, err = writer.WriteChunk(ctx, 2, strings.NewReader("ij"))
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), n)
+	require.NoError(t, writer.Close(ctx))
+
+	obj, err := f.NewObject(ctx, "dir/file.txt")
+	require.NoError(t, err)
+	assert.Equal(t, int64(10), obj.Size())
+	assert.Equal(t, "abcdefghij", fstests.ReadObject(ctx, t, obj, -1))
+}
+
+func TestChunkerOpenChunkWriterRejectsChunkRemote(t *testing.T) {
+	f, _ := newTestOpenChunkWriterFs(t, "none")
+	chunkRemote := f.makeChunkName("parent.txt", 0, "", "")
+	src := object.NewStaticObjectInfo(chunkRemote, mtime1, 4, true, nil, nil)
+
+	_, writer, err := f.OpenChunkWriter(context.Background(), chunkRemote, src)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "chunk overlap")
+	assert.Nil(t, writer)
+}
+
+func TestChunkerOpenChunkWriterRejectsFutureMetadata(t *testing.T) {
+	f, _ := newTestOpenChunkWriterFs(t, "none")
+	ctx := context.Background()
+	const file = "future/test"
+	meta := `{"ver":999,"nchunks":3,"size":9,"garbage":"litter"}`
+	putPart := func(name string, part int, data string) {
+		if part > 0 {
+			name = f.makeChunkName(name, part-1, "", "")
+		}
+		item := fstest.Item{Path: name, ModTime: mtime1}
+		obj := fstests.PutTestContents(ctx, t, f.base, &item, data, true)
+		require.NotNil(t, obj)
+	}
+	putPart(file, 0, meta)
+	putPart(file, 1, "abc")
+	putPart(file, 2, "def")
+	putPart(file, 3, "ghi")
+
+	src := object.NewStaticObjectInfo(file, mtime1, 9, true, nil, nil)
+	_, writer, err := f.OpenChunkWriter(ctx, file, src)
+	assert.ErrorIs(t, err, ErrMetaUnknown)
+	assert.Nil(t, writer)
 }
 
 func TestChunkerChunkWriterWriteChunkTempChunkName(t *testing.T) {
@@ -472,6 +650,70 @@ func TestChunkerChunkWriterWriteChunkRejectsDuplicate(t *testing.T) {
 	assert.Equal(t, "first", base.puts[0].content)
 	assert.Equal(t, int64(5), writer.st.readCount)
 	assert.Equal(t, int64(5), writer.sizeWritten)
+}
+
+func TestChunkerChunkWriterWriteChunkRejectsConcurrentDuplicate(t *testing.T) {
+	ctx := context.Background()
+	base := newBlockingPutFs()
+	writer := newTestChunkerChunkWriterWithBase(t, base, "file.txt", 8)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := writer.WriteChunk(ctx, 0, strings.NewReader("first"))
+		firstDone <- err
+	}()
+	<-base.started
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := writer.WriteChunk(ctx, 0, strings.NewReader("second"))
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate chunk number")
+	case <-time.After(5 * time.Second):
+		t.Fatal("duplicate chunk write did not return while first upload was in flight")
+	}
+
+	close(base.release)
+	require.NoError(t, <-firstDone)
+	base.mu.Lock()
+	defer base.mu.Unlock()
+	require.Len(t, base.puts, 1)
+	assert.Equal(t, "first", base.puts[0].content)
+}
+
+func TestChunkerChunkWriterWriteChunkAllowsConcurrentDifferentChunks(t *testing.T) {
+	ctx := context.Background()
+	writer, _ := newTestChunkerChunkWriter(t, "file.txt", 8)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for chunkNumber, content := range []string{"abcd", "efgh"} {
+		wg.Add(1)
+		go func(chunkNumber int, content string) {
+			defer wg.Done()
+			n, err := writer.WriteChunk(ctx, chunkNumber, strings.NewReader(content))
+			if err == nil {
+				assert.Equal(t, int64(len(content)), n)
+			}
+			errs <- err
+		}(chunkNumber, content)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.Len(t, writer.st.chunks, 2)
+	require.NotNil(t, writer.st.chunks[0])
+	require.NotNil(t, writer.st.chunks[1])
+	assert.Equal(t, int64(8), writer.st.readCount)
+	assert.Equal(t, int64(8), writer.sizeWritten)
+	assert.Len(t, writer.written, 2)
 }
 
 func TestChunkerChunkWriterWriteChunkRejectsInvalidChunkNumber(t *testing.T) {
@@ -654,6 +896,54 @@ func TestChunkerChunkWriterCloseRejectsMissingChunk(t *testing.T) {
 	assert.False(t, writer.closed)
 	assert.False(t, writer.aborted)
 	require.Len(t, base.puts, 1)
+}
+
+func TestChunkerChunkWriterFinalizerErrorAllowsAbortOnly(t *testing.T) {
+	ctx := context.Background()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+	sentinelErr := errors.New("metadata write failed")
+	failBase := newFailPutFs(base, "file.txt", sentinelErr)
+	writer := newTestChunkerChunkWriterWithBase(t, failBase, "file.txt", 8)
+
+	_, err = writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+	require.NoError(t, err)
+	_, err = writer.WriteChunk(ctx, 1, strings.NewReader("efgh"))
+	require.NoError(t, err)
+
+	failBase.enabled = true
+	err = writer.Close(ctx)
+	require.ErrorIs(t, err, sentinelErr)
+	assert.False(t, writer.closed)
+	assert.False(t, writer.aborted)
+	assert.True(t, writer.finalizing)
+
+	n, err := writer.WriteChunk(ctx, 2, strings.NewReader("ij"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "chunk writer is closed")
+	assert.Equal(t, int64(0), n)
+
+	err = writer.Close(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "chunk writer is closed")
+
+	tempRemotes := make([]string, 0, len(writer.st.chunks))
+	for _, chunk := range writer.st.chunks {
+		require.NotNil(t, chunk)
+		tempRemotes = append(tempRemotes, chunk.Remote())
+		_, err := base.NewObject(ctx, chunk.Remote())
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, writer.Abort(ctx))
+	assert.True(t, writer.aborted)
+	for _, remote := range tempRemotes {
+		_, err := base.NewObject(ctx, remote)
+		assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
+	}
 }
 
 func TestChunkerChunkWriterAbortRemovesUploadedTempChunks(t *testing.T) {

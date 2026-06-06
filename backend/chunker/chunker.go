@@ -360,6 +360,12 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 
 	f.features.ListR = nil // Recursive listing may cause chunker skip files
 	f.features.ListP = nil // ListP not supported yet
+	if opt.HashType == "none" {
+		f.features.OpenChunkWriter = f.OpenChunkWriter
+	} else {
+		f.features.OpenChunkWriter = nil
+	}
+	f.features.DisableList(fs.GetConfig(ctx).DisableFeatures)
 
 	return f, err
 }
@@ -1375,6 +1381,13 @@ type chunkerChunkWriter struct {
 	sizeKnown   bool
 	sizeWritten int64
 	written     map[int]fs.Object
+	writing     map[int]struct{}
+	mu          sync.Mutex
+	cond        *sync.Cond
+	inflight    int
+	closing     bool
+	finalizing  bool
+	aborting    bool
 	closed      bool
 	aborted     bool
 }
@@ -1393,7 +1406,7 @@ func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.Ob
 		return nil, err
 	}
 
-	return &chunkerChunkWriter{
+	w := &chunkerChunkWriter{
 		ctx: ctx,
 		f:   f,
 		st: &chunkerUploadState{
@@ -1407,28 +1420,81 @@ func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.Ob
 		chunkSize: int64(f.opt.ChunkSize),
 		sizeKnown: sizeKnown,
 		written:   make(map[int]fs.Object),
-	}, nil
+		writing:   make(map[int]struct{}),
+	}
+	w.cond = sync.NewCond(&w.mu)
+	return w, nil
+}
+
+// OpenChunkWriter opens a chunked writer for hash-free chunker uploads.
+func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
+	if f.opt.HashType != "none" {
+		return info, nil, fmt.Errorf("chunk writer requires hash_type none: %w", fs.ErrorNotImplemented)
+	}
+	if parentPath, _, _, _ := f.parseChunkName(remote); parentPath != "" {
+		return info, nil, fmt.Errorf("chunk writer refused: chunk overlap with %q", parentPath)
+	}
+
+	if obj, errScan := f.scanObject(ctx, remote, true); errScan == nil {
+		if errMeta := obj.(*Object).readMetadata(ctx); errMeta == ErrMetaUnknown {
+			return info, nil, fmt.Errorf("refusing to open chunk writer: %w", errMeta)
+		}
+	}
+
+	chunkWriter, err := f.newChunkerChunkWriter(ctx, remote, src, options...)
+	if err != nil {
+		return info, nil, err
+	}
+	info = fs.ChunkWriterInfo{
+		ChunkSize:   int64(f.opt.ChunkSize),
+		Concurrency: 1,
+		// Chunker writer v1 relies on same-session rollback and removes temporary chunks on error rather than leaving parts for durable resume.
+		LeavePartsOnError: false,
+	}
+	return info, chunkWriter, nil
 }
 
 // WriteChunk writes one temporary hidden data chunk.
 func (w *chunkerChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (int64, error) {
-	switch {
-	case w.closed:
-		return 0, errors.New("chunk writer is closed")
-	case w.aborted:
-		return 0, errors.New("chunk writer is aborted")
-	case chunkNumber < 0:
+	if chunkNumber < 0 {
 		return 0, fmt.Errorf("invalid chunk number %d", chunkNumber)
-	case chunkNumber > maxSafeChunkNumber:
+	}
+	if chunkNumber > maxSafeChunkNumber {
 		return 0, ErrChunkOverflow
 	}
 
+	w.mu.Lock()
+	switch {
+	case w.closed || w.closing || w.finalizing:
+		w.mu.Unlock()
+		return 0, errors.New("chunk writer is closed")
+	case w.aborted || w.aborting:
+		w.mu.Unlock()
+		return 0, errors.New("chunk writer is aborted")
+	}
 	if _, ok := w.written[chunkNumber]; ok {
+		w.mu.Unlock()
 		return 0, fmt.Errorf("duplicate chunk number %d", chunkNumber+w.f.opt.StartFrom)
 	}
 	if chunkNumber < len(w.st.chunks) && w.st.chunks[chunkNumber] != nil {
+		w.mu.Unlock()
 		return 0, fmt.Errorf("duplicate chunk number %d", chunkNumber+w.f.opt.StartFrom)
 	}
+	if _, ok := w.writing[chunkNumber]; ok {
+		w.mu.Unlock()
+		return 0, fmt.Errorf("duplicate chunk number %d", chunkNumber+w.f.opt.StartFrom)
+	}
+	w.writing[chunkNumber] = struct{}{}
+	w.inflight++
+	w.mu.Unlock()
+
+	defer func() {
+		w.mu.Lock()
+		delete(w.writing, chunkNumber)
+		w.inflight--
+		w.cond.Broadcast()
+		w.mu.Unlock()
+	}()
 
 	chunkSize, err := reader.Seek(0, io.SeekEnd)
 	if err != nil {
@@ -1460,6 +1526,27 @@ func (w *chunkerChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 		return 0, err
 	}
 
+	var commitErr error
+	w.mu.Lock()
+	switch {
+	case w.closed || w.finalizing:
+		commitErr = errors.New("chunk writer is closed")
+	case w.aborted:
+		commitErr = errors.New("chunk writer is aborted")
+	}
+	if commitErr == nil {
+		if _, ok := w.written[chunkNumber]; ok {
+			commitErr = fmt.Errorf("duplicate chunk number %d", chunkNumber+w.f.opt.StartFrom)
+		}
+	}
+	if commitErr == nil && chunkNumber < len(w.st.chunks) && w.st.chunks[chunkNumber] != nil {
+		commitErr = fmt.Errorf("duplicate chunk number %d", chunkNumber+w.f.opt.StartFrom)
+	}
+	if commitErr != nil {
+		w.mu.Unlock()
+		w.cleanupFailedChunk(ctx, chunkRemote, chunk)
+		return 0, commitErr
+	}
 	if chunkNumber == len(w.st.chunks) {
 		w.st.chunks = append(w.st.chunks, chunk)
 	} else {
@@ -1475,6 +1562,7 @@ func (w *chunkerChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 	if w.sizeKnown {
 		w.sizeWritten += chunkSize
 	}
+	w.mu.Unlock()
 
 	return chunkSize, nil
 }
@@ -1526,65 +1614,139 @@ func (w *chunkerChunkWriter) cleanupFailedChunk(ctx context.Context, chunkRemote
 
 // Close finalizes a hidden chunk writer upload.
 func (w *chunkerChunkWriter) Close(ctx context.Context) error {
+	w.mu.Lock()
 	switch {
-	case w.closed:
+	case w.closed || w.closing || w.finalizing:
+		w.mu.Unlock()
 		return errors.New("chunk writer is closed")
-	case w.aborted:
+	case w.aborted || w.aborting:
+		w.mu.Unlock()
 		return errors.New("chunk writer is aborted")
+	}
+	w.closing = true
+	for w.inflight > 0 {
+		w.cond.Wait()
 	}
 
 	if len(w.st.chunks) == 0 {
+		w.closing = false
+		w.mu.Unlock()
 		return errors.New("missing chunk 0")
 	}
 
 	var sizeTotal int64
 	for chunkNumber, chunk := range w.st.chunks {
 		if chunk == nil {
+			w.closing = false
+			w.mu.Unlock()
 			return fmt.Errorf("missing chunk %d", chunkNumber+w.f.opt.StartFrom)
 		}
 		sizeTotal += chunk.Size()
 	}
 	if sizeTotal != w.st.readCount {
+		w.closing = false
+		w.mu.Unlock()
 		return fmt.Errorf("incorrect chunks size %d != %d", sizeTotal, w.st.readCount)
 	}
 	if w.sizeKnown && sizeTotal != w.st.sizeTotal {
+		w.closing = false
+		w.mu.Unlock()
 		return fmt.Errorf("incorrect upload size %d != %d", sizeTotal, w.st.sizeTotal)
 	}
 	if w.sizeKnown && w.sizeWritten != w.st.sizeTotal {
+		w.closing = false
+		w.mu.Unlock()
 		return fmt.Errorf("incorrect written size %d != %d", w.sizeWritten, w.st.sizeTotal)
 	}
+	readCount := w.st.readCount
+	var firstChunk fs.Object
+	if len(w.st.chunks) == 1 && readCount <= maxMetadataSize {
+		firstChunk = w.st.chunks[0]
+	}
+	w.mu.Unlock()
 
-	if len(w.st.chunks) == 1 && w.st.readCount <= maxMetadataSize {
-		reader, err := w.st.chunks[0].Open(ctx)
+	if firstChunk != nil {
+		reader, err := firstChunk.Open(ctx)
 		if err != nil {
+			w.mu.Lock()
+			w.closing = false
+			w.cond.Broadcast()
+			w.mu.Unlock()
 			return err
 		}
 		head, err := io.ReadAll(io.LimitReader(reader, maxMetadataSize+1))
 		_ = reader.Close()
 		if err != nil {
+			w.mu.Lock()
+			w.closing = false
+			w.cond.Broadcast()
+			w.mu.Unlock()
 			return err
 		}
+		w.mu.Lock()
 		w.st.smallHead = head
+		w.mu.Unlock()
 	}
+
+	w.mu.Lock()
+	w.finalizing = true
+	w.cond.Broadcast()
+	w.mu.Unlock()
 
 	_, err := w.f.finalizeUpload(ctx, w.st, w.basePut, func() {})
 	if err != nil {
+		w.mu.Lock()
+		w.closing = false
+		w.cond.Broadcast()
+		w.mu.Unlock()
 		return err
 	}
+	w.mu.Lock()
 	w.closed = true
+	w.closing = false
+	w.cond.Broadcast()
+	w.mu.Unlock()
 	return nil
 }
 
 // Abort rolls back chunks uploaded by a hidden chunk writer.
 func (w *chunkerChunkWriter) Abort(ctx context.Context) error {
+	w.mu.Lock()
 	if w.aborted {
+		w.mu.Unlock()
+		return nil
+	}
+	if w.aborting {
+		for w.aborting && !w.aborted {
+			w.cond.Wait()
+		}
+		w.mu.Unlock()
+		return nil
+	}
+	for w.closing {
+		w.cond.Wait()
+	}
+	if w.aborted {
+		w.mu.Unlock()
 		return nil
 	}
 	if w.closed {
+		w.mu.Unlock()
 		return errors.New("chunk writer is closed")
 	}
+	w.aborting = true
+	for w.inflight > 0 {
+		w.cond.Wait()
+	}
+	w.mu.Unlock()
+
 	w.st.rollback(ctx)
+
+	w.mu.Lock()
 	w.aborted = true
+	w.aborting = false
+	w.cond.Broadcast()
+	w.mu.Unlock()
 	return nil
 }
 
