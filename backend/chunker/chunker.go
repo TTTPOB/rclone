@@ -1170,18 +1170,22 @@ func (f *Fs) put(
 	c := f.newChunkingReader(src)
 	wrapIn := c.wrapStream(ctx, in, src)
 
-	var metaObject fs.Object
+	baseRemote := remote
+	st := &chunkerUploadState{
+		src:    src,
+		remote: baseRemote,
+	}
 	defer func() {
 		if err != nil {
-			c.rollback(ctx, metaObject)
+			st.rollback(ctx)
 		}
 	}()
 
-	baseRemote := remote
 	xactID, errXact := f.newXactID(ctx, baseRemote)
 	if errXact != nil {
 		return nil, errXact
 	}
+	st.xactID = xactID
 
 	// Transfer chunks data
 	for c.chunkNo = 0; !c.done; c.chunkNo++ {
@@ -1242,22 +1246,16 @@ func (f *Fs) put(
 		}
 		c.chunkLimit = c.chunkSize
 
-		c.chunks = append(c.chunks, chunk)
+		st.chunks = append(st.chunks, chunk)
 	}
 
-	st := &chunkerUploadState{
-		src:       src,
-		remote:    baseRemote,
-		chunks:    c.chunks,
-		readCount: c.readCount,
-		sizeTotal: c.sizeTotal,
-		smallHead: c.smallHead,
-		md5:       c.md5,
-		sha1:      c.sha1,
-		xactID:    xactID,
-	}
+	st.readCount = c.readCount
+	st.sizeTotal = c.sizeTotal
+	st.smallHead = c.smallHead
+	st.md5 = c.md5
+	st.sha1 = c.sha1
 
-	obj, metaObject, err = f.finalizeUpload(ctx, st, basePut, func() {
+	obj, err = f.finalizeUpload(ctx, st, basePut, func() {
 		c.updateHashes()
 		st.md5, st.sha1 = c.md5, c.sha1
 	})
@@ -1269,10 +1267,10 @@ func (f *Fs) finalizeUpload(
 	st *chunkerUploadState,
 	basePut putFn,
 	updateHashes func(),
-) (fs.Object, fs.Object, error) {
+) (fs.Object, error) {
 	// Validate uploaded size
 	if st.sizeTotal != -1 && st.readCount != st.sizeTotal {
-		return nil, nil, fmt.Errorf("incorrect upload size %d != %d", st.readCount, st.sizeTotal)
+		return nil, fmt.Errorf("incorrect upload size %d != %d", st.readCount, st.sizeTotal)
 	}
 
 	// Check for input that looks like valid metadata
@@ -1295,12 +1293,12 @@ func (f *Fs) finalizeUpload(
 			chunkMoved, errMove := f.baseMove(ctx, chunk, st.remote, delAlways)
 			if errMove != nil {
 				silentlyRemove(ctx, chunk)
-				return nil, nil, errMove
+				return nil, errMove
 			}
 			chunk = chunkMoved
 		}
 
-		return f.newObject("", chunk, nil), nil, nil
+		return f.newObject("", chunk, nil), nil
 	}
 
 	// Validate total size of data chunks
@@ -1309,7 +1307,7 @@ func (f *Fs) finalizeUpload(
 		sizeTotal += chunk.Size()
 	}
 	if sizeTotal != st.readCount {
-		return nil, nil, fmt.Errorf("incorrect chunks size %d != %d", sizeTotal, st.readCount)
+		return nil, fmt.Errorf("incorrect chunks size %d != %d", sizeTotal, st.readCount)
 	}
 
 	// If previous object was chunked, remove its chunks
@@ -1321,7 +1319,7 @@ func (f *Fs) finalizeUpload(
 			chunkRemote := f.makeChunkName(st.remote, chunkNo, "", "")
 			chunkMoved, errMove := f.baseMove(ctx, chunk, chunkRemote, delFailed)
 			if errMove != nil {
-				return nil, nil, errMove
+				return nil, errMove
 			}
 			st.chunks[chunkNo] = chunkMoved
 		}
@@ -1337,7 +1335,7 @@ func (f *Fs) finalizeUpload(
 
 		o := f.newObject(st.remote, nil, st.chunks)
 		o.size = sizeTotal
-		return o, nil, nil
+		return o, nil
 	}
 
 	// Update meta object
@@ -1348,33 +1346,33 @@ func (f *Fs) finalizeUpload(
 		updateHashes()
 		metadata, err = marshalSimpleJSON(ctx, sizeTotal, len(st.chunks), st.md5, st.sha1, st.xactID)
 	}
-	var metaObject fs.Object
 	if err == nil {
 		metaInfo := f.wrapInfo(st.src, st.remote, int64(len(metadata)))
-		metaObject, err = basePut(ctx, bytes.NewReader(metadata), metaInfo)
+		st.metaObject, err = basePut(ctx, bytes.NewReader(metadata), metaInfo)
 	}
 	if err != nil {
-		return nil, metaObject, err
+		return nil, err
 	}
 
-	o := f.newObject("", metaObject, st.chunks)
+	o := f.newObject("", st.metaObject, st.chunks)
 	o.size = sizeTotal
 	o.xactID = st.xactID
-	return o, metaObject, nil
+	return o, nil
 }
 
 type putFn func(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error)
 
 type chunkerUploadState struct {
-	src       fs.ObjectInfo
-	remote    string
-	chunks    []fs.Object
-	readCount int64
-	sizeTotal int64
-	smallHead []byte
-	md5       string
-	sha1      string
-	xactID    string
+	src        fs.ObjectInfo
+	remote     string
+	chunks     []fs.Object
+	metaObject fs.Object
+	readCount  int64
+	sizeTotal  int64
+	smallHead  []byte
+	md5        string
+	sha1       string
+	xactID     string
 }
 
 type chunkingReader struct {
@@ -1387,7 +1385,6 @@ type chunkingReader struct {
 	chunkNo      int
 	err          error
 	done         bool
-	chunks       []fs.Object
 	expectSingle bool
 	smallHead    []byte
 	fs           *Fs
@@ -1524,11 +1521,11 @@ func (c *chunkingReader) dummyRead(in io.Reader, size int64) error {
 }
 
 // rollback removes uploaded temporary chunks
-func (c *chunkingReader) rollback(ctx context.Context, metaObject fs.Object) {
-	if metaObject != nil {
-		c.chunks = append(c.chunks, metaObject)
+func (st *chunkerUploadState) rollback(ctx context.Context) {
+	if st.metaObject != nil {
+		st.chunks = append(st.chunks, st.metaObject)
 	}
-	for _, chunk := range c.chunks {
+	for _, chunk := range st.chunks {
 		if err := chunk.Remove(ctx); err != nil {
 			fs.Errorf(chunk, "Failed to remove temporary chunk: %v", err)
 		}
