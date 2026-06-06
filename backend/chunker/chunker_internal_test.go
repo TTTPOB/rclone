@@ -745,20 +745,43 @@ func testFutureProof(t *testing.T, f *Fs) {
 	putPart(file, 2, "def", "chunk2")
 	putPart(file, 3, "ghi", "chunk3")
 
-	// List should succeed
-	ls, err := f.List(ctx, dir)
-	assert.NoError(t, err)
-	assert.Equal(t, 1, len(ls))
-	assert.Equal(t, int64(9), ls[0].Size())
+	assertFutureObjectShape := func(msg string) fs.Object {
+		// List should succeed
+		ls, err := f.List(ctx, dir)
+		assert.NoError(t, err, msg)
+		require.Equal(t, 1, len(ls), msg)
+		assert.Equal(t, file, ls[0].Remote(), msg)
+		assert.Equal(t, int64(9), ls[0].Size(), msg)
 
-	// NewObject should succeed
-	obj, err := f.NewObject(ctx, file)
-	assert.NoError(t, err)
-	assert.Equal(t, file, obj.Remote())
-	assert.Equal(t, int64(9), obj.Size())
+		// NewObject should succeed
+		obj, err := f.NewObject(ctx, file)
+		assert.NoError(t, err, msg)
+		require.NotNil(t, obj, msg)
+		assert.Equal(t, file, obj.Remote(), msg)
+		assert.Equal(t, int64(9), obj.Size(), msg)
+		return obj
+	}
+
+	assertFutureParts := func(msg string) {
+		checkPart := func(name, want string) {
+			obj, err := f.base.NewObject(ctx, name)
+			require.NoError(t, err, msg)
+			require.NotNil(t, obj, msg)
+			assert.Equal(t, int64(len(want)), obj.Size(), msg)
+			assert.Equal(t, want, fstests.ReadObject(ctx, t, obj, -1), msg)
+		}
+
+		checkPart(file, meta)
+		checkPart(f.makeChunkName(file, 0, "", ""), "abc")
+		checkPart(f.makeChunkName(file, 1, "", ""), "def")
+		checkPart(f.makeChunkName(file, 2, "", ""), "ghi")
+	}
+
+	obj := assertFutureObjectShape("future object before replacement")
+	assertFutureParts("future parts before replacement")
 
 	// Hash must fail
-	_, err = obj.Hash(ctx, hash.SHA1)
+	_, err := obj.Hash(ctx, hash.SHA1)
 	assert.Equal(t, ErrMetaUnknown, err)
 
 	// Move must fail
@@ -774,6 +797,8 @@ func testFutureProof(t *testing.T, f *Fs) {
 	buf := bytes.NewBufferString("abc")
 	_, err = f.Put(ctx, buf, oi)
 	assert.Error(t, err)
+	assertFutureObjectShape("future object after Put replacement refusal")
+	assertFutureParts("future parts after Put replacement refusal")
 
 	// Rcat must fail
 	in := io.NopCloser(bytes.NewBufferString("abc"))
@@ -783,6 +808,13 @@ func testFutureProof(t *testing.T, f *Fs) {
 	if err != nil {
 		assert.Contains(t, err.Error(), "please upgrade rclone")
 	}
+
+	obj = assertFutureObjectShape("future object after Rcat replacement refusal")
+	assertFutureParts("future parts after Rcat replacement refusal")
+	assert.Equal(t, ErrMetaUnknown, func() error {
+		_, err := obj.Hash(ctx, hash.SHA1)
+		return err
+	}())
 }
 
 // The newer method of doing transactions without renaming should still be able to correctly process chunks that were created with renaming
