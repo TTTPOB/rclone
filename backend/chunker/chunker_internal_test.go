@@ -45,6 +45,39 @@ func testPutLarge(t *testing.T, f *Fs, kilobytes int) {
 
 type settings map[string]any
 
+type failPutFs struct {
+	fs.Fs
+	failRemote string
+	failErr    error
+	enabled    bool
+	features   *fs.Features
+}
+
+func newFailPutFs(base fs.Fs, failRemote string, failErr error) *failPutFs {
+	f := &failPutFs{
+		Fs:         base,
+		failRemote: failRemote,
+		failErr:    failErr,
+	}
+	f.features = base.Features().Wrap(f)
+	return f
+}
+
+func (f *failPutFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	if f.enabled && src.Remote() == f.failRemote {
+		return nil, f.failErr
+	}
+	return f.Fs.Put(ctx, in, src, options...)
+}
+
+func (f *failPutFs) Features() *fs.Features {
+	return f.features
+}
+
+func (f *failPutFs) UnWrap() fs.Fs {
+	return f.Fs
+}
+
 func deriveFs(ctx context.Context, t *testing.T, f fs.Fs, path string, opts settings) fs.Fs {
 	fsName := strings.Split(f.Name(), "{")[0] // strip off hash
 	configMap := configmap.Simple{}
@@ -1098,6 +1131,51 @@ func testReplacementFailureOrdering(t *testing.T, f *Fs) {
 	}
 }
 
+func testMetadataWriteFailurePreservesNonChunkedObject(t *testing.T, f *Fs) {
+	ctx := context.Background()
+	const (
+		dir         = "metawritefail"
+		filename    = "file"
+		oldContents = "old non-chunked contents"
+	)
+	_ = operations.Purge(ctx, f.base, dir)
+	defer func() {
+		_ = operations.Purge(ctx, f.base, dir)
+	}()
+
+	fsResult := deriveFs(ctx, t, f, dir, settings{
+		"chunk_size":   "1P",
+		"name_format":  "*.#",
+		"hash_type":    "none",
+		"transactions": "rename",
+		"meta_format":  "simplejson",
+	})
+	chunkFs, ok := fsResult.(*Fs)
+	require.True(t, ok, "fs must be a chunker remote")
+
+	oldObject := testPutFile(ctx, t, chunkFs, filename, oldContents, "upload old non-chunked file", true)
+	oldChunkerObject, ok := oldObject.(*Object)
+	require.True(t, ok)
+	require.Nil(t, oldChunkerObject.chunks, "old object must be non-chunked")
+
+	sentinelErr := errors.New("metadata write failed")
+	failBase := newFailPutFs(chunkFs.base, filename, sentinelErr)
+	chunkFs.base = failBase
+	chunkFs.features = chunkFs.features.WrapsFs(chunkFs, failBase)
+
+	replacementContents := `{"ver":1,"size":1,"nchunks":1}`
+	replacementInfo := object.NewStaticObjectInfo(filename, mtime1, int64(len(replacementContents)), true, nil, nil)
+	failBase.enabled = true
+	_, err := chunkFs.Put(ctx, bytes.NewBufferString(replacementContents), replacementInfo)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, sentinelErr)
+
+	restoredObject, err := chunkFs.NewObject(ctx, filename)
+	require.NoError(t, err)
+	require.NotNil(t, restoredObject)
+	assert.Equal(t, oldContents, fstests.ReadObject(ctx, t, restoredObject, -1))
+}
+
 // The newer method of doing transactions without renaming should still be able to correctly process chunks that were created with renaming
 // If you attempt to do the inverse, however, the data chunks will be ignored causing commands to perform incorrectly
 func testBackwardsCompatibility(t *testing.T, f *Fs) {
@@ -1349,6 +1427,9 @@ func (f *Fs) InternalTest(t *testing.T) {
 	})
 	t.Run("ReplacementFailureOrdering", func(t *testing.T) {
 		testReplacementFailureOrdering(t, f)
+	})
+	t.Run("MetadataWriteFailurePreservesNonChunkedObject", func(t *testing.T) {
+		testMetadataWriteFailurePreservesNonChunkedObject(t, f)
 	})
 	t.Run("BackwardsCompatibility", func(t *testing.T) {
 		testBackwardsCompatibility(t, f)
