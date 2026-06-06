@@ -861,42 +861,61 @@ func testChunkerServerSideMove(t *testing.T, f *Fs) {
 	_ = operations.Purge(ctx, f.base, dir)
 }
 
-// Test that md5all creates metadata even for small files
+// Test that md5all creates metadata even for small and zero-byte files
 func testMD5AllSlow(t *testing.T, f *Fs) {
 	ctx := context.Background()
-	fsResult := deriveFs(ctx, t, f, "md5all", settings{
-		"chunk_size":   "1P",
-		"name_format":  "*.#",
-		"hash_type":    "md5all",
-		"transactions": "rename",
-		"meta_format":  "simplejson",
-	})
-	chunkFs, ok := fsResult.(*Fs)
-	require.True(t, ok, "fs must be a chunker remote")
-	baseFs := chunkFs.base
-	if !baseFs.Features().SlowHash {
-		t.Skipf("this test needs a base fs with slow hash, e.g. local")
+	for _, test := range []struct {
+		name    string
+		content string
+		md5     string
+	}{
+		{
+			name:    "zero-byte",
+			content: "",
+			md5:     "d41d8cd98f00b204e9800998ecf8427e",
+		}, {
+			name:    "small",
+			content: "-",
+			md5:     "336d5ebc5436534e61d16e63ddfca327",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fsResult := deriveFs(ctx, t, f, path.Join("md5all", test.name), settings{
+				"chunk_size":   "1P",
+				"name_format":  "*.#",
+				"hash_type":    "md5all",
+				"transactions": "rename",
+				"meta_format":  "simplejson",
+			})
+			chunkFs, ok := fsResult.(*Fs)
+			require.True(t, ok, "fs must be a chunker remote")
+			baseFs := chunkFs.base
+			if !baseFs.Features().SlowHash {
+				t.Skipf("this test needs a base fs with slow hash, e.g. local")
+			}
+
+			assert.True(t, chunkFs.useMD5, "must use md5")
+			assert.True(t, chunkFs.hashAll, "must hash all files")
+
+			_ = testPutFile(ctx, t, chunkFs, "file", test.content, "error", true)
+			obj, err := chunkFs.NewObject(ctx, "file")
+			require.NoError(t, err)
+			sum, err := obj.Hash(ctx, hash.MD5)
+			assert.NoError(t, err)
+			assert.Equal(t, test.md5, sum)
+
+			list, err := baseFs.List(ctx, "")
+			require.NoError(t, err)
+			assert.Equal(t, 2, len(list))
+			_, err = baseFs.NewObject(ctx, "file")
+			assert.NoError(t, err, "metadata must be created")
+			chunk, err := baseFs.NewObject(ctx, "file.1")
+			require.NoError(t, err, "first chunk must be created")
+			assert.Equal(t, int64(len(test.content)), chunk.Size())
+
+			require.NoError(t, operations.Purge(ctx, baseFs, ""))
+		})
 	}
-
-	assert.True(t, chunkFs.useMD5, "must use md5")
-	assert.True(t, chunkFs.hashAll, "must hash all files")
-
-	_ = testPutFile(ctx, t, chunkFs, "file", "-", "error", true)
-	obj, err := chunkFs.NewObject(ctx, "file")
-	require.NoError(t, err)
-	sum, err := obj.Hash(ctx, hash.MD5)
-	assert.NoError(t, err)
-	assert.Equal(t, "336d5ebc5436534e61d16e63ddfca327", sum)
-
-	list, err := baseFs.List(ctx, "")
-	require.NoError(t, err)
-	assert.Equal(t, 2, len(list))
-	_, err = baseFs.NewObject(ctx, "file")
-	assert.NoError(t, err, "metadata must be created")
-	_, err = baseFs.NewObject(ctx, "file.1")
-	assert.NoError(t, err, "first chunk must be created")
-
-	require.NoError(t, operations.Purge(ctx, baseFs, ""))
 }
 
 // InternalTest dispatches all internal tests
