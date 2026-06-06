@@ -628,6 +628,109 @@ func testChunkNumberOverflow(t *testing.T, f *Fs) {
 	_ = file.Remove(ctx)
 }
 
+func testMissingChunk(t *testing.T, f *Fs) {
+	if !f.useMeta {
+		t.Skip("this test requires metadata support")
+	}
+	const dir = "missing"
+	ctx := context.Background()
+	saveOpt := f.opt
+	defer func() {
+		f.opt.FailHard = false
+		_ = operations.Purge(ctx, f.base, dir)
+		f.opt = saveOpt
+	}()
+	f.opt.FailHard = false
+
+	modTime := fstest.Time("2001-02-03T04:05:06.499999999Z")
+	chunks := []string{"abc", "def", "ghi"}
+	var fullSize int64
+	for _, chunk := range chunks {
+		fullSize += int64(len(chunk))
+	}
+
+	assertErrorContains := func(t *testing.T, err error, want string) {
+		t.Helper()
+		assert.Error(t, err)
+		if err != nil {
+			assert.Contains(t, err.Error(), want)
+		}
+	}
+
+	putBase := func(t *testing.T, name, contents string) {
+		t.Helper()
+		item := fstest.Item{Path: name, ModTime: modTime}
+		obj := fstests.PutTestContents(ctx, t, f.base, &item, contents, true)
+		require.NotNil(t, obj)
+	}
+
+	putMissingChunkObject := func(t *testing.T, caseName string, missingChunkNo int) (filename string, presentSize int64) {
+		t.Helper()
+		filename = path.Join(dir, caseName, "file")
+		metadata, err := marshalSimpleJSON(ctx, fullSize, len(chunks), "", "", "")
+		require.NoError(t, err)
+		putBase(t, filename, string(metadata))
+		for chunkNo, contents := range chunks {
+			if chunkNo == missingChunkNo {
+				continue
+			}
+			putBase(t, f.makeChunkName(filename, chunkNo, "", ""), contents)
+			presentSize += int64(len(contents))
+		}
+		return filename, presentSize
+	}
+
+	assertListedObject := func(t *testing.T, filename string, wantSize int64) {
+		t.Helper()
+		entries, err := f.List(ctx, path.Dir(filename))
+		require.NoError(t, err)
+		require.Equal(t, 1, len(entries))
+		obj, ok := entries[0].(fs.Object)
+		require.True(t, ok)
+		assert.Equal(t, filename, obj.Remote())
+		assert.Equal(t, wantSize, obj.Size())
+	}
+
+	t.Run("Middle", func(t *testing.T) {
+		filename, _ := putMissingChunkObject(t, "middle", 1)
+
+		f.opt.FailHard = false
+		entries, err := f.List(ctx, path.Dir(filename))
+		require.NoError(t, err)
+		assert.Empty(t, entries)
+		_, err = f.NewObject(ctx, filename)
+		assertErrorContains(t, err, "has missing chunks")
+
+		f.opt.FailHard = true
+		_, err = f.List(ctx, path.Dir(filename))
+		assertErrorContains(t, err, "has missing chunks")
+		_, err = f.NewObject(ctx, filename)
+		assertErrorContains(t, err, "has missing chunks")
+	})
+
+	t.Run("Last", func(t *testing.T) {
+		filename, presentSize := putMissingChunkObject(t, "last", 2)
+
+		f.opt.FailHard = false
+		assertListedObject(t, filename, presentSize)
+		f.opt.FailHard = true
+		assertListedObject(t, filename, presentSize)
+
+		obj, err := f.NewObject(ctx, filename)
+		require.NoError(t, err)
+		require.NotNil(t, obj)
+		assert.Equal(t, filename, obj.Remote())
+		assert.Equal(t, presentSize, obj.Size())
+
+		reader, err := obj.Open(ctx)
+		assert.Nil(t, reader)
+		assertErrorContains(t, err, "metadata doesn't match file size")
+		sum, err := obj.Hash(ctx, hash.MD5)
+		assert.Empty(t, sum)
+		assertErrorContains(t, err, "metadata doesn't match file size")
+	})
+}
+
 func testMetadataInput(t *testing.T, f *Fs) {
 	const minChunkForTest = 50
 	if f.opt.ChunkSize < minChunkForTest {
@@ -1057,6 +1160,9 @@ func (f *Fs) InternalTest(t *testing.T) {
 	})
 	t.Run("ChunkNumberOverflow", func(t *testing.T) {
 		testChunkNumberOverflow(t, f)
+	})
+	t.Run("MissingChunk", func(t *testing.T) {
+		testMissingChunk(t, f)
 	})
 	t.Run("MetadataInput", func(t *testing.T) {
 		testMetadataInput(t, f)
