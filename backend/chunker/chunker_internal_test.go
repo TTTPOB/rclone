@@ -815,6 +815,114 @@ func testMetadataInput(t *testing.T, f *Fs) {
 	runSubtest(futureMeta, "future")
 }
 
+func TestSimpleJSONMetadata(t *testing.T) {
+	ctx := context.Background()
+	const (
+		md5sum  = "d41d8cd98f00b204e9800998ecf8427e"
+		sha1sum = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+		txnID   = "tx123"
+	)
+
+	t.Run("MarshalFieldShape", func(t *testing.T) {
+		for _, tt := range []struct {
+			name    string
+			size    int64
+			nChunks int
+			md5     string
+			sha1    string
+			xactID  string
+			want    string
+		}{
+			{
+				name:    "required fields",
+				size:    0,
+				nChunks: 0,
+				want:    `{"ver":1,"size":0,"nchunks":0}`,
+			},
+			{
+				name:    "hashes without transaction",
+				size:    123,
+				nChunks: 4,
+				md5:     md5sum,
+				sha1:    sha1sum,
+				want:    `{"ver":1,"size":123,"nchunks":4,"md5":"d41d8cd98f00b204e9800998ecf8427e","sha1":"da39a3ee5e6b4b0d3255bfef95601890afd80709"}`,
+			},
+			{
+				name:    "transaction without hashes",
+				size:    123,
+				nChunks: 4,
+				xactID:  txnID,
+				want:    `{"ver":2,"size":123,"nchunks":4,"txn":"tx123"}`,
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				data, err := marshalSimpleJSON(ctx, tt.size, tt.nChunks, tt.md5, tt.sha1, tt.xactID)
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, string(data))
+			})
+		}
+	})
+
+	t.Run("UnmarshalFieldShape", func(t *testing.T) {
+		metadata := []byte(`{"ver":2,"size":123,"nchunks":4,"md5":"d41d8cd98f00b204e9800998ecf8427e","sha1":"da39a3ee5e6b4b0d3255bfef95601890afd80709","txn":"tx123"}`)
+		info, madeByChunker, err := unmarshalSimpleJSON(ctx, nil, metadata)
+		require.NoError(t, err)
+		require.NotNil(t, info)
+		assert.True(t, madeByChunker)
+		assert.Equal(t, int64(123), info.Size())
+		assert.Equal(t, 4, info.nChunks)
+		assert.Equal(t, md5sum, info.md5)
+		assert.Equal(t, sha1sum, info.sha1)
+		assert.Equal(t, txnID, info.xactID)
+	})
+
+	t.Run("MarshalSizeLimit", func(t *testing.T) {
+		txnForEncodedLen := func(want int) string {
+			t.Helper()
+			data, err := marshalSimpleJSON(ctx, 1, 1, "", "", "x")
+			require.NoError(t, err)
+			require.GreaterOrEqual(t, want, len(data))
+			return strings.Repeat("x", want-len(data)+1)
+		}
+
+		data, err := marshalSimpleJSON(ctx, 1, 1, "", "", txnForEncodedLen(maxMetadataSizeWritten-1))
+		require.NoError(t, err)
+		assert.Len(t, data, maxMetadataSizeWritten-1)
+
+		data, err = marshalSimpleJSON(ctx, 1, 1, "", "", txnForEncodedLen(maxMetadataSizeWritten))
+		assert.Nil(t, data)
+		assert.EqualError(t, err, "metadata can't be this big, please report to rclone developers")
+	})
+
+	t.Run("UnmarshalSizeAndVersionLimits", func(t *testing.T) {
+		paddedFutureMetadata := func(want int) []byte {
+			t.Helper()
+			prefix := `{"ver":999,"size":1,"nchunks":1,"pad":"`
+			suffix := `"}`
+			require.GreaterOrEqual(t, want, len(prefix)+len(suffix))
+			return []byte(prefix + strings.Repeat("x", want-len(prefix)-len(suffix)) + suffix)
+		}
+
+		info, madeByChunker, err := unmarshalSimpleJSON(ctx, nil, []byte(`{"ver":0,"size":1,"nchunks":1}`))
+		assert.Nil(t, info)
+		assert.False(t, madeByChunker)
+		assert.EqualError(t, err, "wrong version")
+
+		exactLimit := paddedFutureMetadata(maxMetadataSizeWritten)
+		require.Len(t, exactLimit, maxMetadataSizeWritten)
+		info, madeByChunker, err = unmarshalSimpleJSON(ctx, nil, exactLimit)
+		assert.Nil(t, info)
+		assert.True(t, madeByChunker)
+		assert.Equal(t, ErrMetaUnknown, err)
+
+		tooBig := append(exactLimit, ' ')
+		info, madeByChunker, err = unmarshalSimpleJSON(ctx, nil, tooBig)
+		assert.Nil(t, info)
+		assert.False(t, madeByChunker)
+		assert.Equal(t, ErrMetaTooBig, err)
+	})
+}
+
 // Test that chunker refuses to change on objects with future/unknown metadata
 func testFutureProof(t *testing.T, f *Fs) {
 	if !f.useMeta {
