@@ -649,11 +649,12 @@ func testMetadataInput(t *testing.T, f *Fs) {
 		require.True(t, len(contents) > 2 && len(contents) < minChunkForTest, description+" test data is correct")
 
 		part := testPutFile(ctx, t, f.base, f.makeChunkName(filename, 0, "", ""), "oops", "", true)
+		require.NotNil(t, part)
 		_ = testPutFile(ctx, t, f, filename, contents, "upload "+description, false)
 
 		obj, err := f.NewObject(ctx, filename)
-		assert.NoError(t, err, "access "+description)
-		assert.NotNil(t, obj)
+		require.NoError(t, err, "access "+description)
+		require.NotNil(t, obj)
 		assert.Equal(t, int64(len(contents)), obj.Size(), "size "+description)
 
 		o, ok := obj.(*Object)
@@ -667,6 +668,23 @@ func testMetadataInput(t *testing.T, f *Fs) {
 			_ = obj.Remove(ctx)
 			_ = part.Remove(ctx)
 		}()
+
+		metaObj, err := f.base.NewObject(ctx, filename)
+		assert.NoError(t, err, description+" has metadata object")
+		assert.NotNil(t, metaObj)
+		if metaObj != nil {
+			assert.NotEqual(t, int64(len(contents)), metaObj.Size(), description+" metadata is not user data")
+		}
+
+		chunkObj, err := f.base.NewObject(ctx, f.makeChunkName(filename, 0, "", ""))
+		require.NoError(t, err, description+" has data chunk")
+		assert.Equal(t, int64(len(contents)), chunkObj.Size(), description+" data chunk size")
+		chunkReader, err := chunkObj.Open(ctx)
+		require.NoError(t, err, description+" open data chunk")
+		chunkData, err := io.ReadAll(chunkReader)
+		assert.NoError(t, err, description+" read data chunk")
+		assert.Equal(t, contents, string(chunkData), description+" data chunk contents")
+		_ = chunkReader.Close()
 
 		r, err := obj.Open(ctx)
 		assert.NoError(t, err, "open "+description)
