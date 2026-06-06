@@ -8,6 +8,7 @@ import (
 	"io"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -837,17 +838,83 @@ func testBackwardsCompatibility(t *testing.T, f *Fs) {
 
 	modTime := fstest.Time("2001-02-03T04:05:06.499999999Z")
 	contents := random.String(250)
-	newFile := func(f fs.Fs, name string) (fs.Object, string) {
+	chunkCount := (len(contents) + int(f.opt.ChunkSize) - 1) / int(f.opt.ChunkSize)
+	require.Greater(t, chunkCount, 1)
+	newFile := func(f fs.Fs, name string) (*Object, string) {
 		filename := path.Join(dir, name)
 		item := fstest.Item{Path: filename, ModTime: modTime}
 		obj := fstests.PutTestContents(ctx, t, f, &item, contents, true)
 		require.NotNil(t, obj)
-		return obj, filename
+		chunkerObj, ok := obj.(*Object)
+		require.True(t, ok)
+		return chunkerObj, filename
+	}
+	assertBaseObjectNames := func(filename, xactID string) {
+		entries, err := f.base.List(ctx, dir)
+		require.NoError(t, err)
+
+		var got []string
+		for _, entry := range entries {
+			obj, ok := entry.(fs.Object)
+			if !ok {
+				continue
+			}
+			remote := obj.Remote()
+			mainRemote, _, _, _ := f.parseChunkName(remote)
+			if remote == filename || mainRemote == filename {
+				got = append(got, remote)
+			}
+		}
+		sort.Strings(got)
+
+		want := []string{filename}
+		for chunkNo := range chunkCount {
+			want = append(want, f.makeChunkName(filename, chunkNo, "", xactID))
+		}
+		sort.Strings(want)
+		assert.Equal(t, want, got)
+
+		for _, remote := range got {
+			mainRemote, _, ctrlType, gotXactID := f.parseChunkName(remote)
+			if mainRemote == filename && ctrlType == "" {
+				assert.Equal(t, xactID, gotXactID)
+			}
+		}
+	}
+	assertMetadataXactID := func(filename, xactID string) {
+		metaObj, err := f.base.NewObject(ctx, filename)
+		require.NoError(t, err)
+		reader, err := metaObj.Open(ctx)
+		require.NoError(t, err)
+		metadata, err := io.ReadAll(reader)
+		_ = reader.Close()
+		require.NoError(t, err)
+
+		info, madeByChunker, err := unmarshalSimpleJSON(ctx, metaObj, metadata)
+		require.NoError(t, err)
+		require.True(t, madeByChunker)
+		assert.Equal(t, int64(len(contents)), info.Size())
+		assert.Equal(t, chunkCount, info.nChunks)
+		assert.Equal(t, xactID, info.xactID)
+	}
+	assertReadable := func(filename string) {
+		obj, err := f.NewObject(ctx, filename)
+		require.NoError(t, err)
+		require.NotNil(t, obj)
+		reader, err := obj.Open(ctx)
+		require.NoError(t, err)
+		data, err := io.ReadAll(reader)
+		_ = reader.Close()
+		require.NoError(t, err)
+		assert.Equal(t, contents, string(data))
 	}
 
 	f.opt.FailHard = false
 	f.useNoRename = false
 	file, fileName := newFile(f, "renamefile")
+	require.Empty(t, file.xactID)
+	assertBaseObjectNames(fileName, "")
+	assertMetadataXactID(fileName, "")
 
 	f.opt.FailHard = false
 	item := fstest.NewItem(fileName, contents, modTime)
@@ -857,15 +924,18 @@ func testBackwardsCompatibility(t *testing.T, f *Fs) {
 
 	f.useNoRename = true
 	fstest.CheckListingWithRoot(t, f, dir, items, nil, f.Precision())
-	_, err := f.NewObject(ctx, fileName)
-	assert.NoError(t, err)
+	assertReadable(fileName)
 
 	f.opt.FailHard = true
-	_, err = f.List(ctx, dir)
+	_, err := f.List(ctx, dir)
 	assert.NoError(t, err)
 
 	f.opt.FailHard = false
-	_ = file.Remove(ctx)
+	norenameFile, norenameFileName := newFile(f, "norenamefile")
+	require.NotEmpty(t, norenameFile.xactID)
+	assertBaseObjectNames(norenameFileName, norenameFile.xactID)
+	assertMetadataXactID(norenameFileName, norenameFile.xactID)
+	assertReadable(norenameFileName)
 }
 
 func testChunkerServerSideMove(t *testing.T, f *Fs) {
