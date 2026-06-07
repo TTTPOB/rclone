@@ -1476,6 +1476,25 @@ func TestChunkerChunkWriterHashCalculatedFallback(t *testing.T) {
 	}
 }
 
+func TestChunkerChunkWriterHashRetryRestoresCheckpoint(t *testing.T) {
+	ctx := newChunkWriterRetryTestContext(2)
+	uploadErr := errors.New("temporary upload failure")
+	base := newChunkWriterRetryPutFs(chunkWriterPutResult{err: fserrors.RetryError(uploadErr)})
+	writer := newTestChunkerChunkWriterWithSource(t, base, "md5", "file.txt", newHashTrackingObjectInfo("file.txt", 8, newSlowHashFs(object.MemoryFs), nil))
+
+	_, err := writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+	require.NoError(t, err)
+	_, err = writer.WriteChunk(ctx, 1, strings.NewReader("efgh"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close(ctx))
+
+	require.GreaterOrEqual(t, len(base.puts), 3)
+	assert.Equal(t, "abcd", base.puts[0].content)
+	assert.Equal(t, "abcd", base.puts[1].content)
+	assert.Equal(t, "efgh", base.puts[2].content)
+	assert.Equal(t, "e8dc4081b13434b45189a720b77b6818", writer.st.md5)
+}
+
 func TestChunkerChunkWriterHashReadFailurePreservesOldChunkedObject(t *testing.T) {
 	ctx := context.Background()
 	const filename = "dir/file.txt"
@@ -1507,7 +1526,15 @@ func TestChunkerChunkWriterHashReadFailurePreservesOldChunkedObject(t *testing.T
 	replacementContents := "klmnopqrstuv"
 	replacementSrc := object.NewStaticObjectInfo(filename, mtime1, int64(len(replacementContents)), true, nil, nil)
 	failBase.enabled = true
-	err = oldChunkerObject.Update(ctx, strings.NewReader(replacementContents), replacementSrc)
+	writer, err := f.newChunkerChunkWriter(ctx, filename, replacementSrc)
+	require.NoError(t, err)
+	_, err = writer.WriteChunk(ctx, 1, strings.NewReader(replacementContents[4:8]))
+	require.NoError(t, err)
+	_, err = writer.WriteChunk(ctx, 0, strings.NewReader(replacementContents[:4]))
+	require.NoError(t, err)
+	_, err = writer.WriteChunk(ctx, 2, strings.NewReader(replacementContents[8:]))
+	require.NoError(t, err)
+	err = writer.Close(ctx)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, sentinelErr)
 

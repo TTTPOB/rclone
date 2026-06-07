@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/sha1"
+	"encoding"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1324,6 +1325,8 @@ type chunkerChunkWriter struct {
 	basePut     putFn
 	options     []fs.OpenOption
 	hasher      gohash.Hash
+	hashChunk   int
+	hashOrdered bool
 	chunkSize   int64
 	sizeKnown   bool
 	sizeWritten int64
@@ -1365,13 +1368,14 @@ func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.Ob
 			md5:       md5sum,
 			sha1:      sha1sum,
 		},
-		basePut:   f.base.Put,
-		options:   append([]fs.OpenOption(nil), options...),
-		hasher:    hasher,
-		chunkSize: int64(f.opt.ChunkSize),
-		sizeKnown: sizeKnown,
-		written:   make(map[int]fs.Object),
-		writing:   make(map[int]struct{}),
+		basePut:     f.base.Put,
+		options:     append([]fs.OpenOption(nil), options...),
+		hasher:      hasher,
+		hashOrdered: hasher != nil,
+		chunkSize:   int64(f.opt.ChunkSize),
+		sizeKnown:   sizeKnown,
+		written:     make(map[int]fs.Object),
+		writing:     make(map[int]struct{}),
 	}
 	w.cond = sync.NewCond(&w.mu)
 	return w, nil
@@ -1420,8 +1424,33 @@ func chunkWriterHashSource(src fs.ObjectInfo) fs.ObjectInfo {
 	return src
 }
 
+func checkpointHash(h gohash.Hash) ([]byte, error) {
+	m, ok := h.(encoding.BinaryMarshaler)
+	if !ok {
+		return nil, errors.New("hash does not support checkpoint")
+	}
+	return m.MarshalBinary()
+}
+
+func restoreHash(h gohash.Hash, checkpoint []byte) error {
+	u, ok := h.(encoding.BinaryUnmarshaler)
+	if !ok {
+		return errors.New("hash does not support restore")
+	}
+	return u.UnmarshalBinary(checkpoint)
+}
+
 func (w *chunkerChunkWriter) updateHashesFromChunks(ctx context.Context) error {
 	if w.hasher == nil {
+		return nil
+	}
+	if w.hashOrdered && w.hashChunk == len(w.st.chunks) {
+		switch {
+		case w.f.useMD5:
+			w.st.md5 = hex.EncodeToString(w.hasher.Sum(nil))
+		case w.f.useSHA1:
+			w.st.sha1 = hex.EncodeToString(w.hasher.Sum(nil))
+		}
 		return nil
 	}
 
@@ -1529,18 +1558,51 @@ func (w *chunkerChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 
 	chunkRemote := w.f.makeChunkName(w.st.remote, chunkNumber, "", w.st.xactID)
 	chunkInfo := w.f.wrapInfo(w.st.src, chunkRemote, chunkSize)
+	var hashCheckpoint []byte
+	hashThisChunk := false
+	if w.hasher != nil {
+		w.mu.Lock()
+		hashThisChunk = w.hashOrdered && chunkNumber == w.hashChunk
+		if hashThisChunk {
+			hashCheckpoint, err = checkpointHash(w.hasher)
+			if err != nil {
+				w.hashOrdered = false
+				hashThisChunk = false
+			}
+		} else {
+			w.hashOrdered = false
+		}
+		w.mu.Unlock()
+	}
+
 	var chunk fs.Object
+	firstAttempt := true
 	err = fs.NewPacer(ctx, pacer.NewDefault()).Call(func() (bool, error) {
+		if !firstAttempt && hashThisChunk {
+			if err := restoreHash(w.hasher, hashCheckpoint); err != nil {
+				return false, err
+			}
+		}
+		firstAttempt = false
 		if _, err := reader.Seek(0, io.SeekStart); err != nil {
 			return false, fmt.Errorf("failed to seek chunk: %w", err)
 		}
 
-		var err error
-		chunk, err = w.basePut(ctx, reader, chunkInfo, w.options...)
+		putReader := io.Reader(reader)
+		if hashThisChunk {
+			putReader = io.TeeReader(reader, w.hasher)
+		}
+		chunk, err = w.basePut(ctx, putReader, chunkInfo, w.options...)
 		if err == nil {
 			return false, nil
 		}
 
+		if hashThisChunk {
+			restoreErr := restoreHash(w.hasher, hashCheckpoint)
+			if restoreErr != nil {
+				err = errors.Join(err, restoreErr)
+			}
+		}
 		w.cleanupFailedChunk(ctx, chunkRemote, chunk)
 		chunk = nil
 		return shouldRetryChunkWriterPut(ctx, err)
@@ -1584,6 +1646,9 @@ func (w *chunkerChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 	w.st.readCount += chunkSize
 	if w.sizeKnown {
 		w.sizeWritten += chunkSize
+	}
+	if hashThisChunk {
+		w.hashChunk++
 	}
 	w.mu.Unlock()
 
