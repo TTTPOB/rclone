@@ -246,6 +246,23 @@ Falling back to SHA1 if unsupported.`,
 				},
 			},
 		}, {
+			Name:     "concurrent_buffer",
+			Advanced: true,
+			Default:  fs.Tristate{},
+			Help: `Choose whether chunker buffers user-forced concurrent chunk writer uploads.
+
+When unset, chunker chooses the default strategy. Setting this to "true" buffers
+each concurrent chunk in memory so retries and ordered hash calculation can
+replay it from the buffer. Setting it to "false" avoids that chunk-sized buffer
+and retries rewind the supplied chunk reader with Seek(0).`,
+			Examples: []fs.OptionExample{{
+				Value: "true",
+				Help:  "Buffer each concurrent chunk in memory.",
+			}, {
+				Value: "false",
+				Help:  "Do not buffer concurrent chunks; retry by seeking the supplied chunk reader.",
+			}},
+		}, {
 			Name:     "transactions",
 			Advanced: true,
 			Default:  "rename",
@@ -371,14 +388,15 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 
 // Options defines the configuration for this backend
 type Options struct {
-	Remote       string        `config:"remote"`
-	ChunkSize    fs.SizeSuffix `config:"chunk_size"`
-	NameFormat   string        `config:"name_format"`
-	StartFrom    int           `config:"start_from"`
-	MetaFormat   string        `config:"meta_format"`
-	HashType     string        `config:"hash_type"`
-	FailHard     bool          `config:"fail_hard"`
-	Transactions string        `config:"transactions"`
+	Remote           string        `config:"remote"`
+	ChunkSize        fs.SizeSuffix `config:"chunk_size"`
+	NameFormat       string        `config:"name_format"`
+	StartFrom        int           `config:"start_from"`
+	MetaFormat       string        `config:"meta_format"`
+	HashType         string        `config:"hash_type"`
+	FailHard         bool          `config:"fail_hard"`
+	ConcurrentBuffer fs.Tristate   `config:"concurrent_buffer"`
+	Transactions     string        `config:"transactions"`
 }
 
 // Fs represents a wrapped fs.Fs
@@ -1304,7 +1322,7 @@ type chunkerMultipartUpload struct {
 
 func (u chunkerMultipartUpload) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.ChunkWriterInfo, fs.ChunkWriter, error) {
 	var info fs.ChunkWriterInfo
-	chunkWriter, err := u.f.newChunkerChunkWriter(ctx, remote, src, options...)
+	chunkWriter, err := u.f.newChunkerChunkWriter(ctx, remote, src, false, options...)
 	if err != nil {
 		return info, nil, err
 	}
@@ -1319,37 +1337,41 @@ func (u chunkerMultipartUpload) OpenChunkWriter(ctx context.Context, remote stri
 
 // chunkerChunkWriter writes chunker uploads through fs.OpenChunkWriter.
 type chunkerChunkWriter struct {
-	ctx         context.Context
-	f           *Fs
-	st          *chunkerUploadState
-	basePut     putFn
-	options     []fs.OpenOption
-	hasher      gohash.Hash
-	hashChunk   int
-	hashOrdered bool
-	chunkSize   int64
-	sizeKnown   bool
-	sizeWritten int64
-	written     map[int]fs.Object
-	writing     map[int]struct{}
-	mu          sync.Mutex
-	cond        *sync.Cond
-	inflight    int
-	closing     bool
-	finalizing  bool
-	aborting    bool
-	closed      bool
-	aborted     bool
+	ctx              context.Context
+	f                *Fs
+	st               *chunkerUploadState
+	basePut          putFn
+	options          []fs.OpenOption
+	hasher           gohash.Hash
+	hashChunk        int
+	hashOrdered      bool
+	chunkSize        int64
+	sizeKnown        bool
+	sizeWritten      int64
+	forcedConcurrent bool
+	concurrentBuffer bool
+	written          map[int]fs.Object
+	writing          map[int]struct{}
+	mu               sync.Mutex
+	cond             *sync.Cond
+	inflight         int
+	closing          bool
+	finalizing       bool
+	aborting         bool
+	closed           bool
+	aborted          bool
 }
 
 var _ fs.ChunkWriter = (*chunkerChunkWriter)(nil)
 
-func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (*chunkerChunkWriter, error) {
+func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, useConcurrentConfig bool, options ...fs.OpenOption) (*chunkerChunkWriter, error) {
 	sizeTotal := src.Size()
 	sizeKnown := sizeTotal >= 0
 	if !sizeKnown {
 		sizeTotal = -1
 	}
+	ci := fs.GetConfig(ctx)
+	forcedConcurrent := useConcurrentConfig && ci.MultiThreadSet && ci.MultiThreadStreams > 1
 
 	xactID, err := f.newXactID(ctx, remote)
 	if err != nil {
@@ -1368,14 +1390,16 @@ func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.Ob
 			md5:       md5sum,
 			sha1:      sha1sum,
 		},
-		basePut:     f.base.Put,
-		options:     append([]fs.OpenOption(nil), options...),
-		hasher:      hasher,
-		hashOrdered: hasher != nil,
-		chunkSize:   int64(f.opt.ChunkSize),
-		sizeKnown:   sizeKnown,
-		written:     make(map[int]fs.Object),
-		writing:     make(map[int]struct{}),
+		basePut:          f.base.Put,
+		options:          append([]fs.OpenOption(nil), options...),
+		hasher:           hasher,
+		hashOrdered:      hasher != nil,
+		chunkSize:        int64(f.opt.ChunkSize),
+		sizeKnown:        sizeKnown,
+		forcedConcurrent: forcedConcurrent,
+		concurrentBuffer: f.opt.ConcurrentBuffer.Valid && f.opt.ConcurrentBuffer.Value,
+		written:          make(map[int]fs.Object),
+		writing:          make(map[int]struct{}),
 	}
 	w.cond = sync.NewCond(&w.mu)
 	return w, nil
@@ -1493,7 +1517,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		}
 	}
 
-	chunkWriter, err := f.newChunkerChunkWriter(ctx, remote, src, options...)
+	chunkWriter, err := f.newChunkerChunkWriter(ctx, remote, src, true, options...)
 	if err != nil {
 		return info, nil, err
 	}

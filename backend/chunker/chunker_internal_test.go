@@ -597,7 +597,7 @@ func newTestChunkerChunkWriter(t *testing.T, remote string, size int64) (*chunke
 	f := newTestChunkerFsWithBase(t, ctx, base, "none")
 
 	src := object.NewStaticObjectInfo(remote, mtime1, size, true, nil, nil)
-	writer, err := f.newChunkerChunkWriter(ctx, remote, src)
+	writer, err := f.newChunkerChunkWriter(ctx, remote, src, false)
 	require.NoError(t, err)
 	return writer, base
 }
@@ -646,7 +646,7 @@ func newTestChunkerChunkWriterWithBase(t *testing.T, base fs.Fs, remote string, 
 	f := newTestChunkerFsWithBase(t, ctx, base, "none")
 
 	src := object.NewStaticObjectInfo(remote, mtime1, size, true, nil, nil)
-	writer, err := f.newChunkerChunkWriter(ctx, remote, src)
+	writer, err := f.newChunkerChunkWriter(ctx, remote, src, false)
 	require.NoError(t, err)
 	return writer
 }
@@ -656,7 +656,7 @@ func newTestChunkerChunkWriterWithSource(t *testing.T, base fs.Fs, hashType, rem
 	ctx := context.Background()
 	f := newTestChunkerFsWithBase(t, ctx, base, hashType)
 
-	writer, err := f.newChunkerChunkWriter(ctx, remote, src)
+	writer, err := f.newChunkerChunkWriter(ctx, remote, src, false)
 	require.NoError(t, err)
 	return writer
 }
@@ -754,6 +754,34 @@ func TestChunkerOpenChunkWriterRespectsDisableFeatures(t *testing.T) {
 
 	f, _ = newTestOpenChunkWriterFsWithContext(t, ctx, "none")
 	assert.False(t, f.Features().ChunkWriterDoesntSeek)
+}
+
+func TestChunkerConcurrentBufferConfig(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name  string
+		extra string
+		want  fs.Tristate
+	}{
+		{name: "unset", want: fs.Tristate{}},
+		{name: "true", extra: ",concurrent_buffer=true", want: fs.Tristate{Valid: true, Value: true}},
+		{name: "false", extra: ",concurrent_buffer=false", want: fs.Tristate{Valid: true, Value: false}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base, err := fs.TemporaryLocalFs(ctx)
+			require.NoError(t, err)
+			require.NoError(t, base.Mkdir(ctx, ""))
+			t.Cleanup(func() {
+				assert.NoError(t, operations.Purge(ctx, base, ""))
+			})
+
+			chunkerFs, err := fs.NewFs(ctx, fmt.Sprintf(":chunker,remote='%s',chunk_size=4B,hash_type=md5%s:", fs.ConfigStringFull(base), test.extra))
+			require.NoError(t, err)
+			f, ok := chunkerFs.(*Fs)
+			require.True(t, ok)
+			assert.Equal(t, test.want, f.opt.ConcurrentBuffer)
+		})
+	}
 }
 
 func TestChunkerOpenChunkWriterDirectSupportsHashModes(t *testing.T) {
@@ -1413,7 +1441,7 @@ func TestChunkerChunkWriterHashMD5SlowSourceSkipsPreHash(t *testing.T) {
 		hash.MD5: "00000000000000000000000000000000",
 	})
 	chunkerFs := newTestChunkerFsWithBase(t, ctx, base, "md5")
-	writer, err := chunkerFs.newChunkerChunkWriter(ctx, "file.txt", chunkerFs.wrapInfo(src, "file.txt", src.Size()))
+	writer, err := chunkerFs.newChunkerChunkWriter(ctx, "file.txt", chunkerFs.wrapInfo(src, "file.txt", src.Size()), false)
 	require.NoError(t, err)
 
 	_, err = writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
@@ -1526,7 +1554,7 @@ func TestChunkerChunkWriterHashReadFailurePreservesOldChunkedObject(t *testing.T
 	replacementContents := "klmnopqrstuv"
 	replacementSrc := object.NewStaticObjectInfo(filename, mtime1, int64(len(replacementContents)), true, nil, nil)
 	failBase.enabled = true
-	writer, err := f.newChunkerChunkWriter(ctx, filename, replacementSrc)
+	writer, err := f.newChunkerChunkWriter(ctx, filename, replacementSrc, false)
 	require.NoError(t, err)
 	_, err = writer.WriteChunk(ctx, 1, strings.NewReader(replacementContents[4:8]))
 	require.NoError(t, err)
