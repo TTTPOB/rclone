@@ -718,11 +718,13 @@ func testPutFile(ctx context.Context, t *testing.T, f fs.Fs, name, contents, mes
 	return obj
 }
 
-func checkMultipartWriterPuts(t *testing.T, f *Fs, puts []multipartTrackingPutCall, remote string, dataChunks int) {
+func checkMultipartWriterPuts(t *testing.T, f *Fs, puts []multipartTrackingPutCall, remote string, dataChunks int, requireSeekable bool) {
 	t.Helper()
 	require.Len(t, puts, dataChunks+1)
 	for i, call := range puts[:dataChunks] {
-		assert.True(t, call.seekable, "data chunk %d should be uploaded from multipart buffer", i)
+		if requireSeekable {
+			assert.True(t, call.seekable, "data chunk %d should be uploaded from multipart buffer", i)
+		}
 		parentPath, chunkNo, ctrlType, xactID := f.parseChunkName(call.remote)
 		assert.Equal(t, remote, parentPath)
 		assert.Equal(t, i, chunkNo)
@@ -897,7 +899,7 @@ func TestChunkerHashNonePutUsesMultipartWriterPath(t *testing.T) {
 	trackingBase.mu.Lock()
 	puts := append([]multipartTrackingPutCall(nil), trackingBase.puts...)
 	trackingBase.mu.Unlock()
-	checkMultipartWriterPuts(t, f, puts, src.Remote(), 3)
+	checkMultipartWriterPuts(t, f, puts, src.Remote(), 3, true)
 }
 
 func TestChunkerHashNoneUpdateUsesMultipartWriterPath(t *testing.T) {
@@ -927,7 +929,7 @@ func TestChunkerHashNoneUpdateUsesMultipartWriterPath(t *testing.T) {
 	trackingBase.mu.Lock()
 	puts := append([]multipartTrackingPutCall(nil), trackingBase.puts...)
 	trackingBase.mu.Unlock()
-	checkMultipartWriterPuts(t, f, puts, "dir/file.txt", 3)
+	checkMultipartWriterPuts(t, f, puts, "dir/file.txt", 3, true)
 }
 
 func TestChunkerHashNonePutStreamUnknownSizeUsesMultipartWriterPath(t *testing.T) {
@@ -952,7 +954,7 @@ func TestChunkerHashNonePutStreamUnknownSizeUsesMultipartWriterPath(t *testing.T
 	trackingBase.mu.Lock()
 	puts := append([]multipartTrackingPutCall(nil), trackingBase.puts...)
 	trackingBase.mu.Unlock()
-	checkMultipartWriterPuts(t, f, puts, src.Remote(), 3)
+	checkMultipartWriterPuts(t, f, puts, src.Remote(), 3, true)
 	assert.Equal(t, int64(10), obj.Size())
 }
 
@@ -994,7 +996,7 @@ func TestChunkerHashMD5PutUsesMultipartWriterPath(t *testing.T) {
 	trackingBase.mu.Lock()
 	puts := append([]multipartTrackingPutCall(nil), trackingBase.puts...)
 	trackingBase.mu.Unlock()
-	checkMultipartWriterPuts(t, f, puts, src.Remote(), 3)
+	checkMultipartWriterPuts(t, f, puts, src.Remote(), 3, false)
 }
 
 func TestChunkerHashMD5PutStreamUnknownSizeUsesMultipartWriterPath(t *testing.T) {
@@ -1022,7 +1024,31 @@ func TestChunkerHashMD5PutStreamUnknownSizeUsesMultipartWriterPath(t *testing.T)
 	trackingBase.mu.Lock()
 	puts := append([]multipartTrackingPutCall(nil), trackingBase.puts...)
 	trackingBase.mu.Unlock()
-	checkMultipartWriterPuts(t, f, puts, src.Remote(), 3)
+	checkMultipartWriterPuts(t, f, puts, src.Remote(), 3, false)
+}
+
+func TestChunkerHashMD5PutStreamConcurrentBufferFalseForwardOnly(t *testing.T) {
+	ctx := context.Background()
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+	trackingBase := newMultipartTrackingFs(base)
+	trackingBase.features.PutStream = nil
+	f := newTestChunkerFsWithBase(t, ctx, trackingBase, "md5")
+	f.opt.ConcurrentBuffer = fs.Tristate{Valid: true, Value: false}
+
+	src := object.NewStaticObjectInfo("stream/md5-forward.txt", mtime1, -1, true, nil, nil)
+	obj, err := f.PutStream(ctx, readers.NoSeeker{Reader: strings.NewReader("abcdefghij")}, src)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, int64(10), obj.Size())
+
+	trackingBase.mu.Lock()
+	puts := append([]multipartTrackingPutCall(nil), trackingBase.puts...)
+	trackingBase.mu.Unlock()
+	checkMultipartWriterPuts(t, f, puts, src.Remote(), 3, false)
 }
 
 func TestChunkerHashMD5UpdateUnknownSizeUsesMultipartWriterPath(t *testing.T) {
@@ -1057,7 +1083,7 @@ func TestChunkerHashMD5UpdateUnknownSizeUsesMultipartWriterPath(t *testing.T) {
 	trackingBase.mu.Lock()
 	puts := append([]multipartTrackingPutCall(nil), trackingBase.puts...)
 	trackingBase.mu.Unlock()
-	checkMultipartWriterPuts(t, f, puts, "dir/md5-update.txt", 3)
+	checkMultipartWriterPuts(t, f, puts, "dir/md5-update.txt", 3, false)
 }
 
 func TestChunkerHashNonePutChunkRemoteKeepsSoftFailHardBehavior(t *testing.T) {
@@ -1614,6 +1640,64 @@ func TestChunkerChunkWriterHashForcedConcurrentOrdered(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "e8dc4081b13434b45189a720b77b6818", sum)
 	assert.Equal(t, []hash.Type{hash.MD5}, src.HashCalls())
+}
+
+func TestChunkerOpenChunkWriterForcedConcurrentBufferHashesInOrder(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.MultiThreadSet = true
+	ci.MultiThreadStreams = 2
+
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+	f := newTestChunkerFsWithBase(t, ctx, base, "md5")
+	f.opt.ConcurrentBuffer = fs.Tristate{Valid: true, Value: true}
+	src := newHashTrackingObjectInfo("file.txt", 8, object.MemoryFs, nil)
+
+	_, writer, err := f.OpenChunkWriter(ctx, "file.txt", src)
+	require.NoError(t, err)
+	_, err = writer.WriteChunk(ctx, 1, strings.NewReader("efgh"))
+	require.NoError(t, err)
+	_, err = writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close(ctx))
+
+	obj, err := f.NewObject(ctx, "file.txt")
+	require.NoError(t, err)
+	sum, err := obj.Hash(ctx, hash.MD5)
+	require.NoError(t, err)
+	assert.Equal(t, "e8dc4081b13434b45189a720b77b6818", sum)
+}
+
+func TestChunkerOpenChunkWriterForcedConcurrentSeekHashesFromChunks(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.MultiThreadSet = true
+	ci.MultiThreadStreams = 2
+
+	base, err := fs.TemporaryLocalFs(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, operations.Purge(ctx, base, ""))
+	})
+	f := newTestChunkerFsWithBase(t, ctx, base, "md5")
+	f.opt.ConcurrentBuffer = fs.Tristate{Valid: true, Value: false}
+	src := newHashTrackingObjectInfo("file.txt", 8, object.MemoryFs, nil)
+
+	_, writer, err := f.OpenChunkWriter(ctx, "file.txt", src)
+	require.NoError(t, err)
+	_, err = writer.WriteChunk(ctx, 1, strings.NewReader("efgh"))
+	require.NoError(t, err)
+	_, err = writer.WriteChunk(ctx, 0, strings.NewReader("abcd"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close(ctx))
+
+	obj, err := f.NewObject(ctx, "file.txt")
+	require.NoError(t, err)
+	sum, err := obj.Hash(ctx, hash.MD5)
+	require.NoError(t, err)
+	assert.Equal(t, "e8dc4081b13434b45189a720b77b6818", sum)
 }
 
 func TestChunkerChunkWriterHashMD5QuickFallbackWritesSHA1(t *testing.T) {

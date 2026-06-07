@@ -33,6 +33,7 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/pool"
 )
 
 // Chunker's composite files have one or more chunks
@@ -1345,6 +1346,7 @@ type chunkerChunkWriter struct {
 	hasher           gohash.Hash
 	hashChunk        int
 	hashOrdered      bool
+	hashBuffers      map[int]*pool.RW
 	chunkSize        int64
 	sizeKnown        bool
 	sizeWritten      int64
@@ -1394,6 +1396,7 @@ func (f *Fs) newChunkerChunkWriter(ctx context.Context, remote string, src fs.Ob
 		options:          append([]fs.OpenOption(nil), options...),
 		hasher:           hasher,
 		hashOrdered:      hasher != nil,
+		hashBuffers:      make(map[int]*pool.RW),
 		chunkSize:        int64(f.opt.ChunkSize),
 		sizeKnown:        sizeKnown,
 		forcedConcurrent: forcedConcurrent,
@@ -1462,6 +1465,32 @@ func restoreHash(h gohash.Hash, checkpoint []byte) error {
 		return errors.New("hash does not support restore")
 	}
 	return u.UnmarshalBinary(checkpoint)
+}
+
+func (w *chunkerChunkWriter) commitHashBuffersLocked() error {
+	for w.hashOrdered {
+		buffer := w.hashBuffers[w.hashChunk]
+		if buffer == nil {
+			return nil
+		}
+		delete(w.hashBuffers, w.hashChunk)
+		if _, err := buffer.Seek(0, io.SeekStart); err != nil {
+			_ = buffer.Close()
+			w.hashOrdered = false
+			return err
+		}
+		if _, err := io.Copy(w.hasher, buffer); err != nil {
+			_ = buffer.Close()
+			w.hashOrdered = false
+			return err
+		}
+		if err := buffer.Close(); err != nil {
+			w.hashOrdered = false
+			return err
+		}
+		w.hashChunk++
+	}
+	return nil
 }
 
 func (w *chunkerChunkWriter) updateHashesFromChunks(ctx context.Context) error {
@@ -1582,9 +1611,27 @@ func (w *chunkerChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 
 	chunkRemote := w.f.makeChunkName(w.st.remote, chunkNumber, "", w.st.xactID)
 	chunkInfo := w.f.wrapInfo(w.st.src, chunkRemote, chunkSize)
+	uploadReader := reader
+	var buffer *pool.RW
+	bufferOwned := false
+	if w.forcedConcurrent && w.concurrentBuffer {
+		buffer = multipart.NewRW().Reserve(chunkSize)
+		_, err = io.Copy(buffer, reader)
+		if err != nil {
+			_ = buffer.Close()
+			return 0, fmt.Errorf("failed to buffer chunk: %w", err)
+		}
+		defer func() {
+			if !bufferOwned {
+				_ = buffer.Close()
+			}
+		}()
+		uploadReader = buffer
+	}
+
 	var hashCheckpoint []byte
 	hashThisChunk := false
-	if w.hasher != nil {
+	if w.hasher != nil && !w.forcedConcurrent {
 		w.mu.Lock()
 		hashThisChunk = w.hashOrdered && chunkNumber == w.hashChunk
 		if hashThisChunk {
@@ -1608,13 +1655,13 @@ func (w *chunkerChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 			}
 		}
 		firstAttempt = false
-		if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		if _, err := uploadReader.Seek(0, io.SeekStart); err != nil {
 			return false, fmt.Errorf("failed to seek chunk: %w", err)
 		}
 
-		putReader := io.Reader(reader)
+		putReader := io.Reader(uploadReader)
 		if hashThisChunk {
-			putReader = io.TeeReader(reader, w.hasher)
+			putReader = io.TeeReader(uploadReader, w.hasher)
 		}
 		chunk, err = w.basePut(ctx, putReader, chunkInfo, w.options...)
 		if err == nil {
@@ -1673,6 +1720,14 @@ func (w *chunkerChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, re
 	}
 	if hashThisChunk {
 		w.hashChunk++
+	}
+	if w.hasher != nil && w.forcedConcurrent && w.concurrentBuffer && buffer != nil {
+		w.hashBuffers[chunkNumber] = buffer
+		bufferOwned = true
+		if err := w.commitHashBuffersLocked(); err != nil {
+			w.mu.Unlock()
+			return 0, err
+		}
 	}
 	w.mu.Unlock()
 
@@ -1857,6 +1912,10 @@ func (w *chunkerChunkWriter) Abort(ctx context.Context) error {
 	w.st.rollback(ctx)
 
 	w.mu.Lock()
+	for chunkNumber, buffer := range w.hashBuffers {
+		_ = buffer.Close()
+		delete(w.hashBuffers, chunkNumber)
+	}
 	w.aborted = true
 	w.aborting = false
 	w.cond.Broadcast()
