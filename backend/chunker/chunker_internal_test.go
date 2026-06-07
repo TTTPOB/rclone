@@ -634,6 +634,7 @@ func newTestChunkerFsWithBase(t *testing.T, ctx context.Context, base fs.Fs, has
 	f.features.ListR = nil
 	f.features.ListP = nil
 	f.features.OpenChunkWriter = f.OpenChunkWriter
+	f.features.ChunkWriterDoesntSeek = true
 	f.features.PutStream = f.PutStream
 	f.features.DisableList(fs.GetConfig(ctx).DisableFeatures)
 	return f
@@ -747,6 +748,12 @@ func TestChunkerOpenChunkWriterRespectsDisableFeatures(t *testing.T) {
 
 	f, _ := newTestOpenChunkWriterFsWithContext(t, ctx, "none")
 	assert.Nil(t, f.Features().OpenChunkWriter)
+
+	ctx, ci = fs.AddConfig(context.Background())
+	ci.DisableFeatures = []string{"ChunkWriterDoesntSeek"}
+
+	f, _ = newTestOpenChunkWriterFsWithContext(t, ctx, "none")
+	assert.False(t, f.Features().ChunkWriterDoesntSeek)
 }
 
 func TestChunkerOpenChunkWriterDirectSupportsHashModes(t *testing.T) {
@@ -754,7 +761,7 @@ func TestChunkerOpenChunkWriterDirectSupportsHashModes(t *testing.T) {
 		t.Run(hashType, func(t *testing.T) {
 			f, _ := newTestOpenChunkWriterFs(t, hashType)
 			require.NotNil(t, f.Features().OpenChunkWriter)
-			assert.False(t, f.Features().ChunkWriterDoesntSeek)
+			assert.True(t, f.Features().ChunkWriterDoesntSeek)
 
 			src := object.NewStaticObjectInfo("file.txt", mtime1, 4, true, nil, nil)
 			info, writer, err := f.OpenChunkWriter(context.Background(), src.Remote(), src)

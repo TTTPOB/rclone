@@ -361,6 +361,7 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 	f.features.ListR = nil // Recursive listing may cause chunker skip files
 	f.features.ListP = nil // ListP not supported yet
 	f.features.OpenChunkWriter = f.OpenChunkWriter
+	f.features.ChunkWriterDoesntSeek = true
 	f.features.PutStream = f.PutStream
 	f.features.DisableList(fs.GetConfig(ctx).DisableFeatures)
 
