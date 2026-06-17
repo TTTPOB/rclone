@@ -2,17 +2,22 @@ package webdav_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/backend/webdav"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/fs/object"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -150,4 +155,106 @@ func TestReservedCharactersInPathAreEscaped(t *testing.T) {
 	// The semicolon must be percent-encoded as %3B
 	assert.Contains(t, capturedPath, "my%3Btest", "semicolons in path should be percent-encoded")
 	assert.NotContains(t, capturedPath, "my;test", "raw semicolons should not appear in path")
+}
+
+func TestPutRetriesPropfindAfterUpload(t *testing.T) {
+	var propfindHits int
+	var putBody string
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "PUT":
+			body, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			putBody = string(body)
+			w.WriteHeader(http.StatusCreated)
+		case "PROPFIND":
+			propfindHits++
+			if propfindHits < 3 {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writePropfindObject(t, w, r.URL.Path, int64(len(putBody)))
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	})
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	configfile.Install()
+	m := configmap.Simple{
+		"type":            "webdav",
+		"url":             ts.URL,
+		"pacer_min_sleep": "0s",
+		"retry_propfind":  "2",
+	}
+
+	f, err := webdav.NewFs(context.Background(), remoteName, "", m)
+	require.NoError(t, err)
+
+	content := "abc"
+	src := object.NewStaticObjectInfo("file.txt", time.Unix(0, 0), int64(len(content)), true, nil, nil)
+	obj, err := f.Put(context.Background(), strings.NewReader(content), src)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, content, putBody)
+	assert.Equal(t, 3, propfindHits)
+	assert.Equal(t, int64(len(content)), obj.Size())
+}
+
+func TestPutRetryPropfindExhaustedReturnsRetryError(t *testing.T) {
+	var propfindHits int
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "PUT":
+			w.WriteHeader(http.StatusCreated)
+		case "PROPFIND":
+			propfindHits++
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	})
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	configfile.Install()
+	m := configmap.Simple{
+		"type":            "webdav",
+		"url":             ts.URL,
+		"pacer_min_sleep": "0s",
+		"retry_propfind":  "2",
+	}
+
+	f, err := webdav.NewFs(context.Background(), remoteName, "", m)
+	require.NoError(t, err)
+
+	content := "abc"
+	src := object.NewStaticObjectInfo("file.txt", time.Unix(0, 0), int64(len(content)), true, nil, nil)
+	obj, err := f.Put(context.Background(), strings.NewReader(content), src)
+	require.Error(t, err)
+	assert.NotNil(t, obj)
+	assert.True(t, fserrors.IsRetryError(err))
+	assert.True(t, errors.Is(err, fs.ErrorObjectNotFound))
+	assert.Equal(t, 3, propfindHits)
+}
+
+func writePropfindObject(t *testing.T, w http.ResponseWriter, href string, size int64) {
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusMultiStatus)
+	_, err := fmt.Fprintf(w, `<d:multistatus xmlns:d="DAV:">
+<d:response>
+ <d:href>%s</d:href>
+ <d:propstat>
+  <d:prop>
+   <d:getcontentlength>%d</d:getcontentlength>
+   <d:getlastmodified>Wed, 27 Sep 2017 14:28:34 GMT</d:getlastmodified>
+  </d:prop>
+  <d:status>HTTP/1.1 200 OK</d:status>
+ </d:propstat>
+</d:response>
+</d:multistatus>`, href, size)
+	require.NoError(t, err)
 }

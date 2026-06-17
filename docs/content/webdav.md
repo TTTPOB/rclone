@@ -266,6 +266,19 @@ Properties:
 - Type:        Duration
 - Default:     10ms
 
+#### --webdav-retry-propfind
+
+Number of times to retry PROPFIND after an upload returns success but the uploaded object is not yet visible.
+
+Rclone performs a PROPFIND after upload to read back object metadata. Some WebDAV servers can return a transient 404 immediately after a successful upload. This option retries that confirmation check with exponential backoff. If the object is still not visible after all retries, rclone returns a retryable error so the upload operation can be retried by the caller.
+
+Properties:
+
+- Config:      retry_propfind
+- Env Var:     RCLONE_WEBDAV_RETRY_PROPFIND
+- Type:        int
+- Default:     10
+
 #### --webdav-nextcloud-chunk-size
 
 Nextcloud upload chunk size.

@@ -51,6 +51,8 @@ const (
 	defaultDepth  = "1" // depth for PROPFIND
 )
 
+const defaultRetryPropfind = 10
+
 const defaultEncodingSharepointNTLM = (encoder.EncodeWin |
 	encoder.EncodeHashPercent | // required by IIS/8.5 in contrast with onedrive which doesn't need it
 	(encoder.Display &^ encoder.EncodeDot) | // test with IIS/8.5 shows that EncodeDot is not needed
@@ -144,6 +146,11 @@ You can set multiple headers, e.g. '"Cookie","name=value","Authorization","xxx"'
 			Default:  minSleep,
 			Advanced: true,
 		}, {
+			Name:     "retry_propfind",
+			Help:     "Number of times to retry PROPFIND after an upload returns success but the uploaded object is not yet visible.",
+			Default:  defaultRetryPropfind,
+			Advanced: true,
+		}, {
 			Name: "nextcloud_chunk_size",
 			Help: `Nextcloud upload chunk size.
 
@@ -198,6 +205,7 @@ type Options struct {
 	Enc                encoder.MultiEncoder `config:"encoding"`
 	Headers            fs.CommaSepList      `config:"headers"`
 	PacerMinSleep      fs.Duration          `config:"pacer_min_sleep"`
+	RetryPropfind      int                  `config:"retry_propfind"`
 	ChunkSize          fs.SizeSuffix        `config:"nextcloud_chunk_size"`
 	ExcludeShares      bool                 `config:"owncloud_exclude_shares"`
 	ExcludeMounts      bool                 `config:"owncloud_exclude_mounts"`
@@ -1423,6 +1431,44 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 	return o.setMetaData(info)
 }
 
+func (o *Object) confirmUploadedObject(ctx context.Context) error {
+	o.hasMetaData = false
+	err := o.readMetaData(ctx)
+	if err == nil || !errors.Is(err, fs.ErrorObjectNotFound) || o.fs.opt.RetryPropfind <= 0 {
+		return err
+	}
+
+	sleep := time.Duration(o.fs.opt.PacerMinSleep)
+	for try := 1; try <= o.fs.opt.RetryPropfind; try++ {
+		if sleep > 0 {
+			fs.Debugf(o, "PROPFIND did not find uploaded object; retry %d/%d after %v", try, o.fs.opt.RetryPropfind, sleep)
+			timer := time.NewTimer(sleep)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return ctx.Err()
+			}
+			sleep *= 2
+		} else {
+			fs.Debugf(o, "PROPFIND did not find uploaded object; retry %d/%d", try, o.fs.opt.RetryPropfind)
+		}
+
+		o.hasMetaData = false
+		err = o.readMetaData(ctx)
+		if err == nil || !errors.Is(err, fs.ErrorObjectNotFound) {
+			return err
+		}
+	}
+
+	return fserrors.RetryError(fmt.Errorf("uploaded object was not visible after %d PROPFIND retries: %w", o.fs.opt.RetryPropfind, err))
+}
+
 // ModTime returns the modification time of the object
 //
 // It attempts to read the objects mtime and if that isn't present the
@@ -1586,8 +1632,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	}
 	// read metadata from remote
-	o.hasMetaData = false
-	return o.readMetaData(ctx)
+	return o.confirmUploadedObject(ctx)
 }
 
 func (o *Object) extraHeaders(ctx context.Context, src fs.ObjectInfo) map[string]string {
